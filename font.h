@@ -132,7 +132,10 @@ inline void buildAtlas(uint8_t* out, int w, int h) {
         for (int y = STRIP_Y; y < STRIP_Y + 8; y++) px(x, y);
 }
 
-// UV rect for a character glyph (v grows downward in the texture).
+// UV rect for a character glyph, rendered as a 6x7 cell (v grows downward in
+// the texture). The glyph ink is 5px wide (atlas columns cx+1..cx+5); we sample
+// one extra empty column (cx+6) so adjacent letters get a 1px gap and don't
+// stick together.
 struct UVRect { float u0, v0, u1, v1; };
 
 inline UVRect glyphUV(int c) {
@@ -141,7 +144,7 @@ inline UVRect glyphUV(int c) {
     int cy = (c >> 4) * 8;
     return {
         (cx + 1) / (float)ATLAS_W, (cy + 1) / (float)ATLAS_H,
-        (cx + 6) / (float)ATLAS_W, (cy + 8) / (float)ATLAS_H
+        (cx + 7) / (float)ATLAS_W, (cy + 8) / (float)ATLAS_H
     };
 }
 
