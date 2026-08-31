@@ -20,7 +20,7 @@ tetris: main.cpp window.mm font.h window.h $(SHADERS)
 
 # Regenerate the embedded shader headers (run once if you edit the .sc sources).
 shaders:
-	BIN=$(BIN) BGFX=$(BGFX) bash scripts/build_shaders.sh
+	BIN=$(BIN) BGFX=$(BGFX) python3 scripts/build_shaders.py
 
 clean:
 	rm -f tetris
