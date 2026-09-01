@@ -12,6 +12,11 @@
 #    cmake --build build            # ./tetris
 #    cmake --build build --target shaders   # regenerate embedded shader headers
 #
+#  Clean:
+#    cmake --build build --target clean        # app artifacts only
+#    cmake --build build --target third-party-clean  # third-party artifacts
+#    cmake --build build --target distclean    # everything (app + third-party)
+#
 #  Threading contract (bgfx): the game thread owns bgfx (init/frame/shutdown);
 #  the Cocoa thread only pumps events and must never call bgfx::renderFrame().
 # ============================================================================
@@ -83,3 +88,14 @@ target_link_libraries(tetris PRIVATE
     "-framework CoreVideo"
     "-framework CoreMedia"
     "-framework VideoToolbox")
+
+# ----------------------------------------------------------------------------
+#  distclean — remove ALL build artifacts: the app (equivalent to the
+#  built-in `clean`, which cannot be customized) plus third-party
+#  (bx, bimg, bgfx, shaderc + deps). The build/ dir and its cache are kept.
+# ----------------------------------------------------------------------------
+add_custom_target(distclean
+    COMMAND ${CMAKE_MAKE_PROGRAM} -C "${CMAKE_BINARY_DIR}" clean
+    COMMAND ${CMAKE_MAKE_PROGRAM} -C "${CMAKE_BINARY_DIR}" third-party-clean
+    COMMENT "[clean] removing all build artifacts (app + third-party)"
+    VERBATIM)
