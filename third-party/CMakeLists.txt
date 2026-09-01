@@ -46,6 +46,13 @@ add_custom_target(tp_shaderc DEPENDS "${TP_BIN}/shaderc${TP_SUFFIX}")
 # Everything the app needs from third-party.
 add_custom_target(third-party DEPENDS tp_bx tp_bimg tp_bgfx tp_shaderc)
 
+# Remove all third-party artifacts (bx, bimg, bgfx, shaderc + deps):
+#   cmake --build build --target third-party-clean
+add_custom_target(third-party-clean
+    COMMAND make -C "${TP_PROJ}" "config=${TP_CFG}" clean
+    COMMENT "[tp] cleaning third-party (bx bimg bgfx shaderc)"
+    VERBATIM)
+
 # Export to the parent scope.
 set(TP_BIN    "${TP_BIN}"    PARENT_SCOPE)
 set(BGFX_ROOT "${BGFX_ROOT}" PARENT_SCOPE)
