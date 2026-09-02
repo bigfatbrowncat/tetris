@@ -161,13 +161,17 @@ public:
     bool ok = false;
     const bgfx::Caps* caps = nullptr;
 
-    bool init(const void* nwh) {
+    bool init(const UiWindow* win) {
         bgfx::Init init;
-        init.type = bgfx::RendererType::Count;   // auto-select (Metal on macOS)
+#if BX_PLATFORM_OSX
+        init.type = bgfx::RendererType::Count;   // auto-select -> Metal
+#else
+        init.type = bgfx::RendererType::OpenGL;  // GLSL headers; auto would pick Vulkan
+#endif
         init.fallback = true;
-        init.platformData.nwh = (void*)nwh;
+        init.platformData.nwh = win->nwh;
         init.platformData.ndt = nullptr;
-        init.platformData.type = bgfx::NativeWindowHandleType::Default;
+        init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
         init.resolution.width = 640;
         init.resolution.height = 640;
         init.resolution.reset = BGFX_RESET_VSYNC;
@@ -371,7 +375,7 @@ public:
 
 Renderer::Renderer() : m_impl(new Impl()) {}
 Renderer::~Renderer() {}
-bool Renderer::init(const void* nwh) { return m_impl->init(nwh); }
+bool Renderer::init(const UiWindow* win) { return m_impl->init(win); }
 void Renderer::shutdown() { m_impl->shutdown(); }
 void Renderer::render(const TetrisBackend::Snapshot& s, uint32_t w, uint32_t h) { m_impl->render(s, w, h); }
 void Renderer::endFrame() { m_impl->endFrame(); }

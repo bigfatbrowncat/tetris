@@ -2,9 +2,9 @@
 //  TetrisFrontend — the bgfx-based frontend.
 //  ---------------------------------------------------------------------------
 //  Owns the game loop: drives a TetrisBackend and a Renderer on a dedicated
-//  (API) thread. The UI thread (macos/) pushes logical keys and window size
-//  and polls done(); the two communicate through lock-free-ish atomics and a
-//  small mutex-guarded key queue.
+//  (API) thread. The UI thread (ui/ + macos/ or gtk/) pushes logical keys and
+//  window size and polls done(); the two communicate through lock-free-ish
+//  atomics and a small mutex-guarded key queue.
 //
 //  Threading (bgfx contract):
 //    - The thread that calls run() owns bgfx: init, per-frame
@@ -22,6 +22,7 @@
 #include <mutex>
 
 #include "tetris_backend.h"
+#include "ui/window.h"
 
 namespace tetris {
 
@@ -35,8 +36,8 @@ public:
     TetrisFrontend& operator=(const TetrisFrontend&) = delete;
 
     // Run the game loop on the calling thread.
-    // nwh: native window handle (Cocoa NSWindow*).
-    void run(const void* nwh);
+    // win: native window data from the UI layer (handle + bgfx platform type).
+    void run(const UiWindow* win);
 
     // --- thread-safe UI-side API --------------------------------------------
     void pushKey(TetrisBackend::Key k);

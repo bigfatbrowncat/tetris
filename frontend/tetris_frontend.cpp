@@ -28,8 +28,8 @@ void TetrisFrontend::setWindowSize(uint32_t w, uint32_t h) {
 void TetrisFrontend::requestStop() { m_stop.store(true); }
 bool TetrisFrontend::done() const { return m_done.load(); }
 
-void TetrisFrontend::run(const void* nwh) {
-    if (!m_renderer->init(nwh)) {
+void TetrisFrontend::run(const UiWindow* win) {
+    if (!m_renderer->init(win)) {
         m_done.store(true);
         return;
     }

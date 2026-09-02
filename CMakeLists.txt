@@ -1,10 +1,12 @@
 # ============================================================================
-#  Tetris — macOS (bgfx/Metal + Cocoa)
+#  Tetris — cross-platform (bgfx; macOS Metal+Cocoa / Linux OpenGL+GTK4)
 #  ---------------------------------------------------------------------------
 #  Modules:
 #    backend/   game logic, no UI / no OS          -> libtetrisback.a
 #    frontend/  bgfx renderer + game loop          -> libtetrisfront.a
-#    macos/     Cocoa window + input (OS-specific) -> tetris executable
+#    ui/        platform-neutral window/input C API (window.h)
+#    macos/     Cocoa window + input (OS-specific) -> macOS UI module
+#    gtk/       GTK4 window + input (OS-specific)  -> Linux UI module
 #    third-party/  bgfx / bx / bimg build targets  (see its CMakeLists.txt)
 #
 #  Build:
@@ -18,10 +20,17 @@
 #    cmake --build build --target distclean    # everything (app + third-party)
 #
 #  Threading contract (bgfx): the game thread owns bgfx (init/frame/shutdown);
-#  the Cocoa thread only pumps events and must never call bgfx::renderFrame().
+#  the UI thread (Cocoa or GTK) only pumps events and must never call
+#  bgfx::renderFrame().
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
-project(tetris C CXX OBJCXX)
+
+# The UI language is platform-specific: Objective-C++ on macOS, plain C++ on Linux.
+if(APPLE)
+    project(tetris C CXX OBJCXX)
+else()
+    project(tetris C CXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,6 +44,40 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Third-party bgfx build (targets: tp_bx, tp_bimg, tp_bgfx, tp_shaderc, third-party)
 add_subdirectory(third-party)
+
+# ----------------------------------------------------------------------------
+#  UI module selection (platform detected at configure time)
+# ----------------------------------------------------------------------------
+if(APPLE)
+    set(UI_SOURCES macos/window.mm)
+    set(UI_LINK
+        "-framework Cocoa"
+        "-framework QuartzCore"
+        "-framework Metal"
+        "-framework IOKit"
+        "-framework CoreVideo"
+        "-framework CoreMedia"
+        "-framework VideoToolbox")
+    # Committed Metal headers in shaders/ are used directly.
+    set(PLATFORM_SHADERS_INC "")
+elseif(UNIX)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
+    set(UI_SOURCES gtk/window.cpp)
+    set(UI_LINK PkgConfig::GTK4)
+    # Committed OpenGL headers live in shaders/gl/; stage them in the build
+    # dir so the shared `#include "shaders/vs_quad.h"` in the frontend finds
+    # them before the macOS ones in shaders/.
+    set(GEN_SHADERS "${CMAKE_BINARY_DIR}/gen-shaders")
+    set(PLATFORM_SHADERS_INC ${GEN_SHADERS})
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h")
+        message(WARNING
+            "shaders/gl/*.h not found — run 'cmake --build build --target shaders' "
+            "(after tp_shaderc) before building the app.")
+    endif()
+else()
+    message(FATAL_ERROR "Unsupported platform (need macOS or Linux)")
+endif()
 
 # ----------------------------------------------------------------------------
 #  tetrisback — game logic (no UI, no OS)
@@ -51,8 +94,9 @@ add_library(tetrisfront STATIC
     frontend/renderer.cpp
     frontend/tetris_frontend.cpp)
 target_include_directories(tetrisfront PUBLIC
-    ${CMAKE_SOURCE_DIR}            # shaders/vs_quad.h etc.
-    ${CMAKE_SOURCE_DIR}/frontend   # font.h
+    ${PLATFORM_SHADERS_INC}      # staged platform shader headers (Linux)
+    ${CMAKE_SOURCE_DIR}          # ui/window.h, shaders/vs_quad.h etc.
+    ${CMAKE_SOURCE_DIR}/frontend # font.h
     ${BGFX_ROOT}/include
     ${BX_ROOT}/include)
 target_link_libraries(tetrisfront PUBLIC
@@ -66,28 +110,52 @@ add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)
 #  Explicit target (like the old phony `make shaders`); the app only needs the
 #  headers to exist, which they do (they are committed).
 # ----------------------------------------------------------------------------
-add_custom_target(shaders
+set(SHADER_CMDS
     COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build_shaders.py
-    ENVIRONMENT "BIN=${TP_BIN}" "BGFX=${BGFX_ROOT}"
+    ENVIRONMENT "BIN=${TP_BIN}" "BGFX=${BGFX_ROOT}")
+
+if(NOT APPLE)
+    # The app build compiles against staged copies of the committed OpenGL
+    # headers (so the shared `#include "shaders/vs_quad.h"` resolves to them).
+    set(GEN_SHADER_HDRS
+        ${GEN_SHADERS}/shaders/vs_quad.h
+        ${GEN_SHADERS}/shaders/fs_quad.h)
+    add_custom_command(
+        OUTPUT ${GEN_SHADER_HDRS}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_SHADERS}/shaders
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h ${GEN_SHADERS}/shaders/
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_SOURCE_DIR}/shaders/gl/fs_quad.h ${GEN_SHADERS}/shaders/
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h
+                ${CMAKE_SOURCE_DIR}/shaders/gl/fs_quad.h
+        COMMENT "[shaders] staging OpenGL headers"
+        VERBATIM)
+    add_custom_target(gen_shaders DEPENDS ${GEN_SHADER_HDRS})
+    add_dependencies(tetrisfront gen_shaders)
+    # `shaders` regenerates the headers, then refreshes the staged copies.
+    list(APPEND SHADER_CMDS
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_SHADERS}/shaders
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h ${GEN_SHADERS}/shaders/
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_SOURCE_DIR}/shaders/gl/fs_quad.h ${GEN_SHADERS}/shaders/)
+endif()
+
+add_custom_target(shaders ${SHADER_CMDS}
     COMMENT "[shaders] building vs_quad/fs_quad"
     VERBATIM)
 add_dependencies(shaders tp_shaderc)
 
 # ----------------------------------------------------------------------------
-#  tetris — macOS executable (Cocoa UI module)
+#  tetris — executable (main.cpp + the platform UI module)
 # ----------------------------------------------------------------------------
 add_executable(tetris
-    macos/main.cpp
-    macos/window.mm)
+    main.cpp
+    ${UI_SOURCES})
 target_link_libraries(tetris PRIVATE
     tetrisfront
-    "-framework Cocoa"
-    "-framework QuartzCore"
-    "-framework Metal"
-    "-framework IOKit"
-    "-framework CoreVideo"
-    "-framework CoreMedia"
-    "-framework VideoToolbox")
+    ${UI_LINK})
 
 # ----------------------------------------------------------------------------
 #  distclean — remove ALL build artifacts: the app (equivalent to the

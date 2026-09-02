@@ -1,5 +1,6 @@
 // ============================================================================
-//  Renderer — bgfx (Metal) rendering of a TetrisBackend::Snapshot.
+//  Renderer — bgfx rendering of a TetrisBackend::Snapshot.
+//  (Metal on macOS, OpenGL on Linux — bgfx auto-selects.)
 //  ---------------------------------------------------------------------------
 //  Single dynamic vertex buffer, one draw call per frame. All drawing is
 //  derived from the Snapshot — this class knows nothing about game rules.
@@ -15,6 +16,7 @@
 #include <memory>
 
 #include "tetris_backend.h"
+#include "ui/window.h"
 
 namespace tetris {
 
@@ -25,8 +27,8 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    // Initialize bgfx on the given native window handle (Cocoa NSWindow*).
-    bool init(const void* nwh);
+    // Initialize bgfx on the given native window data (handle + platform type).
+    bool init(const UiWindow* win);
 
     // Destroy resources and shut bgfx down (joins its internal render thread).
     void shutdown();

@@ -1,13 +1,15 @@
+// Cocoa implementation of the platform-neutral UI layer (ui/window.h).
 #import <Cocoa/Cocoa.h>
 #include <mutex>
 #include <deque>
 #include <atomic>
 #include <cstdint>
-#include "window.h"
+#include "ui/window.h"
 
 static NSApplication* s_app = nil;
 static NSWindow* s_window = nil;
 static id s_delegate = nil;
+static UiWindow s_uiWindow = {UI_NWH_DEFAULT, nullptr};
 static std::atomic<bool> s_quit{false};
 static std::mutex s_keyMutex;
 static std::deque<int> s_keys;
@@ -65,7 +67,7 @@ static void updatePixelSize() {
 }
 @end
 
-void cocoaInit(void) {
+void uiInit(void) {
     s_app = [NSApplication sharedApplication];
     [s_app setActivationPolicy:NSApplicationActivationPolicyRegular];
 
@@ -78,7 +80,7 @@ void cocoaInit(void) {
     [s_app setMainMenu:mainMenu];
 }
 
-void* cocoaCreateWindow(uint32_t w, uint32_t h, const char* title) {
+const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     NSRect rect = NSMakeRect(0, 0, w, h);
     NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                        NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
@@ -101,10 +103,12 @@ void* cocoaCreateWindow(uint32_t w, uint32_t h, const char* title) {
     [s_app activateIgnoringOtherApps:YES];
 
     updatePixelSize();
-    return s_window;
+    s_uiWindow.nwhType = UI_NWH_DEFAULT;
+    s_uiWindow.nwh = s_window;
+    return &s_uiWindow;
 }
 
-void cocoaPumpEvents(double timeoutSec) {
+void uiPumpEvents(double timeoutSec) {
     NSDate* deadline = [NSDate dateWithTimeIntervalSinceNow:timeoutSec];
     NSEvent* e;
     while ((e = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -115,11 +119,11 @@ void cocoaPumpEvents(double timeoutSec) {
     }
 }
 
-int cocoaShouldQuit(void) {
+int uiShouldQuit(void) {
     return s_quit ? 1 : 0;
 }
 
-int cocoaPopKey(void) {
+int uiPopKey(void) {
     std::lock_guard<std::mutex> lk(s_keyMutex);
     if (s_keys.empty()) return KEY_NONE;
     int k = s_keys.front();
@@ -127,11 +131,11 @@ int cocoaPopKey(void) {
     return k;
 }
 
-void cocoaWindowSize(uint32_t* w, uint32_t* h) {
+void uiWindowSize(uint32_t* w, uint32_t* h) {
     if (w) *w = s_pxW;
     if (h) *h = s_pxH;
 }
 
-void cocoaShutdown(void) {
+void uiShutdown(void) {
     if (s_app) [s_app terminate:nil];
 }

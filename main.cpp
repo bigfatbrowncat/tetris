@@ -1,13 +1,14 @@
 // ============================================================================
-//  Tetris — macOS entry point (Cocoa UI module).
+//  Tetris — entry point (platform-neutral wiring).
 //  ---------------------------------------------------------------------------
-//  Everything OS-specific lives here (and in window.mm): window creation,
-//  event pumping, key mapping. Game logic is the backend (libtetrisback);
-//  the bgfx game loop is the frontend (libtetrisfront). This file only wires
-//  Cocoa events into the frontend.
+//  Everything OS-specific lives in the UI module (macos/window.mm on macOS,
+//  gtk/window.cpp on Linux): window creation, event pumping, key mapping.
+//  Game logic is the backend (libtetrisback); the bgfx game loop is the
+//  frontend (libtetrisfront). This file only wires UI events into the
+//  frontend.
 //
 //  Threading:
-//    - This (main/Cocoa) thread pumps Cocoa events only (never bgfx::renderFrame)
+//    - This (main/UI) thread pumps UI events only (never bgfx::renderFrame)
 //    - The frontend thread: bgfx::init + game loop (bgfx::frame) + bgfx::shutdown
 //    - bgfx owns its own internal render thread that drives bgfx::renderFrame
 //
@@ -23,14 +24,14 @@
 // ============================================================================
 
 #include "tetris_frontend.h"
-#include "window.h"
+#include "ui/window.h"
 
 #include <cstdio>
 #include <thread>
 
 using namespace tetris;
 
-// Map the Cocoa layer's logical keys to backend input events.
+// Map the UI layer's logical keys to backend input events.
 static TetrisBackend::Key toBackendKey(int k) {
     switch (k) {
         case KEY_LEFT:    return TetrisBackend::Key::Left;
@@ -47,8 +48,8 @@ static TetrisBackend::Key toBackendKey(int k) {
 }
 
 int main() {
-    cocoaInit();
-    void* window = cocoaCreateWindow(640, 640, "Tetris");
+    uiInit();
+    const UiWindow* window = uiCreateWindow(640, 640, "Tetris");
     if (!window) {
         fprintf(stderr, "[tetris] failed to create window\n");
         return 1;
@@ -57,21 +58,21 @@ int main() {
     TetrisFrontend frontend;
     std::thread gameThread(&TetrisFrontend::run, &frontend, window);
 
-    // Pump Cocoa events until the frontend thread has torn down bgfx.
+    // Pump UI events until the frontend thread has torn down bgfx.
     // The actual rendering is driven by bgfx's own internal render thread —
     // we must NOT call bgfx::renderFrame() here (see the notes above).
     while (!frontend.done()) {
-        cocoaPumpEvents(0.016);
+        uiPumpEvents(0.016);
         int k;
-        while ((k = cocoaPopKey()) != KEY_NONE)
+        while ((k = uiPopKey()) != KEY_NONE)
             frontend.pushKey(toBackendKey(k));
         uint32_t pw, ph;
-        cocoaWindowSize(&pw, &ph);
+        uiWindowSize(&pw, &ph);
         frontend.setWindowSize(pw, ph);
-        if (cocoaShouldQuit()) frontend.requestStop();
+        if (uiShouldQuit()) frontend.requestStop();
     }
 
     gameThread.join();
-    cocoaShutdown();
+    uiShutdown();
     return 0;
 }
