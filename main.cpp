@@ -58,9 +58,9 @@ int main() {
     TetrisFrontend frontend;
     std::thread gameThread(&TetrisFrontend::run, &frontend, window);
 
-    // Pump UI events until the frontend thread has torn down bgfx.
-    // The actual rendering is driven by bgfx's own internal render thread —
-    // we must NOT call bgfx::renderFrame() here (see the notes above).
+    // Pump UI events until the frontend game loop has stopped. The actual
+    // rendering is driven by bgfx's own internal render thread — we must NOT
+    // call bgfx::renderFrame() here (see the notes above).
     while (!frontend.loopDone()) {
         uiPumpEvents(0.016);
         int k;
@@ -72,8 +72,8 @@ int main() {
         if (uiShouldQuit()) frontend.requestStop();
     }
 
-    uiShutdown();
-    frontend.uiShutdownDone();
+    frontend.uiShutdownRequested();
     gameThread.join();
+    uiShutdown();
     return 0;
 }

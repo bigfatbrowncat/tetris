@@ -63,8 +63,9 @@ if(APPLE)
 elseif(UNIX)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
+    pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
     set(UI_SOURCES gtk/window.cpp)
-    set(UI_LINK PkgConfig::GTK4)
+    set(UI_LINK PkgConfig::GTK4 PkgConfig::WAYLAND_CLIENT)
     # Committed OpenGL headers live in shaders/gl/; stage them in the build
     # dir so the shared `#include "shaders/vs_quad.h"` in the frontend finds
     # them before the macOS ones in shaders/.

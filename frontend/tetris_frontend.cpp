@@ -28,7 +28,7 @@ void TetrisFrontend::setWindowSize(uint32_t w, uint32_t h) {
 void TetrisFrontend::requestStop() { m_stop.store(true); }
 bool TetrisFrontend::done() const { return m_done.load(); }
 bool TetrisFrontend::loopDone() const { return m_loopDone.load(); }
-void TetrisFrontend::uiShutdownDone() {
+void TetrisFrontend::uiShutdownRequested() {
     {
         std::lock_guard<std::mutex> lock(m_shutdownMutex);
         m_uiShutdown = true;
@@ -98,7 +98,6 @@ void TetrisFrontend::run(const UiWindow* win) {
     // this returns no bgfx thread is left running.
     m_renderer->shutdown();
     m_done.store(true);
-    fprintf(stderr, "[tetris] done. high score: %ld\n", m_backend.state().highScore);
 }
 
 }  // namespace tetris

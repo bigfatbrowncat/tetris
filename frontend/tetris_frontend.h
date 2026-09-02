@@ -46,7 +46,7 @@ public:
     void requestStop();
     bool done() const;
     bool loopDone() const;
-    void uiShutdownDone();
+    void uiShutdownRequested();
 
 private:
     TetrisBackend m_backend;

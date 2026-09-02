@@ -15,20 +15,40 @@
 #else
 #include <gtk/gtk-wayland.h>
 #endif
+#include <wayland-client.h>
 #endif
 
 #include <atomic>
+#include <climits>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include "ui/window.h"
 
 static GtkWidget* s_win = nullptr;
+static GtkWidget* s_area = nullptr;
+static GtkWidget* s_header = nullptr;
+static GdkSurface* s_gdkSurface = nullptr;
 static GtkEventController* s_keyCtrl = nullptr;
 static UiWindow s_uiWindow = {UI_NWH_DEFAULT, nullptr};
+static int s_headerHeightPx = 0;
+static int s_scale = 1;
 static std::atomic<bool> s_quit{false};
 static std::mutex s_keyMutex;
 static std::deque<int> s_keys;
+
+#ifdef GDK_WINDOWING_WAYLAND
+static struct wl_compositor* s_compositor = nullptr;
+static struct wl_subcompositor* s_subcompositor = nullptr;
+static struct wl_surface* s_contentSurface = nullptr;
+static struct wl_subsurface* s_contentSub = nullptr;
+static struct wl_surface* s_rootSurface = nullptr;
+static struct wl_display* s_wlDisplay = nullptr;
+static int s_subPosX = INT_MIN;
+static int s_subPosY = INT_MIN;
+static std::atomic<bool> s_sizePrinted{false};
+#endif
 
 static int mapKey(guint keyval) {
     switch (keyval) {
@@ -63,6 +83,94 @@ static gboolean onCloseRequest(GtkWindow* win, gpointer user) {
     return TRUE;
 }
 
+#ifdef GDK_WINDOWING_WAYLAND
+static int onContentSurfaceDispatcher(const void* user_data, void* target,
+                                      uint32_t opcode, const struct wl_message* msg,
+                                      union wl_argument* args) {
+    (void)user_data; (void)target; (void)msg; (void)args;
+    fprintf(stderr, "[window] content surface event opcode=%u\n", opcode);
+    return 0;
+}
+
+static int headerHeightPx(GtkWidget* header) {
+    if (header == nullptr) return 0;
+    uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(header);
+    s_scale = (int)scale;
+    return (int)(gtk_widget_get_height(header) * (int64_t)scale + 0.5);
+}
+
+static int headerHeightLogical(GtkWidget* header) {
+    if (header == nullptr) return 0;
+    return (int)gtk_widget_get_height(header);
+}
+
+// The subsurface is positioned in the toplevel wl_surface's coordinate space,
+// whose origin is the outer edge of the CSD shadow -- not the visible window.
+// gtk_native_get_surface_transform() gives the shadow offset (surface origin ->
+// widget origin), so the content area (below the header) sits at
+// (shadow + area_window_pos). bgfx renders at the origin of its own surface, so
+// the subsurface must be placed exactly at the content area's top-left.
+static void updateContentSubPosition() {
+    if (s_contentSub == nullptr || s_win == nullptr || s_area == nullptr) return;
+    if (!gtk_widget_get_realized(s_win) || !gtk_widget_get_realized(s_area)) return;
+    double stx = 0.0, sty = 0.0;
+    gtk_native_get_surface_transform(GTK_NATIVE(s_win), &stx, &sty);
+    gdouble ax = 0.0, ay = 0.0;
+    gtk_widget_translate_coordinates(s_area, s_win, 0, 0, &ax, &ay);
+    int px = (int)(stx + ax);
+    int py = (int)(sty + ay);
+    if (px != s_subPosX || py != s_subPosY) {
+        fprintf(stderr, "[window] subsurface pos -> (%d, %d) [shadow (%.0f, %.0f) + area (%.0f, %.0f)]\n",
+                px, py, stx, sty, ax, ay);
+        wl_subsurface_set_position(s_contentSub, (int32_t)px, (int32_t)py);
+        s_subPosX = px;
+        s_subPosY = py;
+    }
+}
+
+static void onHeaderScaleFactorChanged(GObject* obj, GParamSpec* pspec, gpointer user) {
+    (void)obj; (void)pspec; (void)user;
+    if (s_header != nullptr) {
+        s_headerHeightPx = headerHeightPx(s_header);
+    }
+    updateContentSubPosition();
+}
+
+static void onRegistryGlobal(void* data, struct wl_registry* registry,
+                              uint32_t name, const char* interface,
+                              uint32_t version) {
+    (void)data;
+    if (interface == nullptr) return;
+    if (strcmp(interface, "wl_compositor") == 0) {
+        s_compositor = (struct wl_compositor*)wl_registry_bind(registry, name,
+                                                                &wl_compositor_interface, version);
+    } else if (strcmp(interface, "wl_subcompositor") == 0) {
+        s_subcompositor = (struct wl_subcompositor*)wl_registry_bind(registry, name,
+                                                                     &wl_subcompositor_interface, version);
+    }
+}
+
+static void onRegistryGlobalRemove(void* data, struct wl_registry* registry,
+                                   uint32_t name) {
+    (void)data; (void)registry; (void)name;
+}
+
+static bool bindWaylandGlobals(struct wl_display* wlDisplay) {
+    if (s_compositor != nullptr && s_subcompositor != nullptr) return true;
+    struct wl_registry* registry = wl_display_get_registry(wlDisplay);
+    if (registry == nullptr) return false;
+
+    struct wl_registry_listener listener = {};
+    listener.global = onRegistryGlobal;
+    listener.global_remove = onRegistryGlobalRemove;
+    wl_registry_add_listener(registry, &listener, nullptr);
+    wl_display_roundtrip(wlDisplay);
+    wl_registry_destroy(registry);
+
+    return s_compositor != nullptr && s_subcompositor != nullptr;
+}
+#endif
+
 void uiInit(void) {
     gtk_init();
 }
@@ -73,9 +181,26 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     gtk_window_set_default_size(GTK_WINDOW(s_win), (int)w, (int)h);
 
     // A focusable child so the window reliably receives keyboard events.
-    GtkWidget* area = gtk_label_new("");
-    gtk_widget_set_focusable(area, TRUE);
-    gtk_window_set_child(GTK_WINDOW(s_win), area);
+    s_area = gtk_label_new("");
+    gtk_widget_set_focusable(s_area, TRUE);
+    gtk_window_set_child(GTK_WINDOW(s_win), s_area);
+
+    GdkDisplay* display = gdk_display_get_default();
+#ifdef GDK_WINDOWING_WAYLAND
+    const bool wayland = GDK_IS_WAYLAND_DISPLAY(display);
+    if (wayland) {
+        g_setenv("GSK_RENDERER", "cairo", TRUE);
+        g_setenv("GDK_GL_DISABLE", "1", TRUE);
+        s_header = gtk_header_bar_new();
+        GtkWidget* titleLabel = gtk_label_new(title);
+        gtk_header_bar_set_title_widget(GTK_HEADER_BAR(s_header), titleLabel);
+        gtk_header_bar_set_decoration_layout(GTK_HEADER_BAR(s_header), ":close");
+        gtk_window_set_titlebar(GTK_WINDOW(s_win), s_header);
+        g_signal_connect(s_header, "notify::scale-factor", G_CALLBACK(onHeaderScaleFactorChanged), nullptr);
+    }
+#else
+    (void)display;
+#endif
 
     // GTK4 widgets do NOT own event controllers: keep our reference alive for
     // the window's lifetime and remove it in uiShutdown() before destroy.
@@ -86,18 +211,20 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     g_signal_connect(s_win, "close-request", G_CALLBACK(onCloseRequest), nullptr);
 
     gtk_window_present(GTK_WINDOW(s_win));
-    gtk_widget_grab_focus(area);
+    gtk_widget_grab_focus(s_area);
 
-    // Pump until the window is realized so the native surface exists.
-    for (int i = 0; i < 200 && !gtk_widget_get_realized(s_win); i++)
+    // Pump until the window is realized and the content child has an allocation.
+    for (int i = 0; i < 200 &&
+         (!gtk_widget_get_realized(s_win) || gtk_widget_get_height(s_area) == 0); i++)
         uiPumpEvents(0.005);
 
     s_uiWindow.nwhType = UI_NWH_DEFAULT;
     s_uiWindow.nwh = nullptr;
     s_uiWindow.ndt = nullptr;
     GdkSurface* surf = gtk_native_get_surface(GTK_NATIVE(s_win));
+    s_gdkSurface = surf;
 #ifdef GDK_WINDOWING_X11
-    if (surf && GDK_IS_X11_DISPLAY(gdk_display_get_default())) {
+    if (surf && GDK_IS_X11_DISPLAY(display)) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"  // xid getter, still the only X11 API
         s_uiWindow.nwh = (void*)(uintptr_t)gdk_x11_surface_get_xid(GDK_SURFACE(surf));
@@ -105,11 +232,35 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     }
 #endif
 #ifdef GDK_WINDOWING_WAYLAND
-    if (surf && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) {
+    if (surf && GDK_IS_WAYLAND_DISPLAY(display)) {
         // bgfx's EGL display must come from the same wl_display that owns the
         // wl_surface, otherwise wl_egl_window/surface creation fails.
-        s_uiWindow.nwh = gdk_wayland_surface_get_wl_surface(GDK_SURFACE(surf));
-        s_uiWindow.ndt = gdk_wayland_display_get_wl_display(gdk_display_get_default());
+        struct wl_display* wlDisplay = gdk_wayland_display_get_wl_display(display);
+        struct wl_surface* rootSurface = gdk_wayland_surface_get_wl_surface(GDK_SURFACE(surf));
+        s_wlDisplay = wlDisplay;
+        s_rootSurface = rootSurface;
+        bool globalsOk = (wlDisplay != nullptr) && bindWaylandGlobals(wlDisplay);
+        if (wlDisplay != nullptr && rootSurface != nullptr && s_header != nullptr &&
+            globalsOk) {
+            s_contentSurface = wl_compositor_create_surface(s_compositor);
+            s_contentSub = wl_subcompositor_get_subsurface(s_subcompositor,
+                                                           s_contentSurface,
+                                                           rootSurface);
+            s_headerHeightPx = headerHeightPx(s_header);
+            wl_surface_set_buffer_scale(s_contentSurface, (int32_t)s_scale);
+            wl_subsurface_set_position(s_contentSub, 0, (int32_t)headerHeightLogical(s_header));
+            wl_subsurface_place_above(s_contentSub, rootSurface);
+            wl_proxy_add_dispatcher((struct wl_proxy*)s_contentSurface,
+                                    onContentSurfaceDispatcher, nullptr, nullptr);
+            fprintf(stderr, "[window] content surface created scale=%d headerLogical=%d headerPx=%d\n",
+                    s_scale, headerHeightLogical(s_header), s_headerHeightPx);
+            wl_surface_commit(rootSurface);
+            wl_display_flush(wlDisplay);
+            s_uiWindow.nwh = s_contentSurface;
+        } else {
+            s_uiWindow.nwh = rootSurface;
+        }
+        s_uiWindow.ndt = wlDisplay;
         s_uiWindow.nwhType = UI_NWH_WAYLAND;
     }
 #endif
@@ -125,6 +276,15 @@ void uiPumpEvents(double timeoutSec) {
         else
             g_usleep(1000);
     } while (g_get_monotonic_time() < deadline);
+#ifdef GDK_WINDOWING_WAYLAND
+    if (s_rootSurface != nullptr && s_wlDisplay != nullptr) {
+        // Keep the subsurface aligned with the content area (the CSD shadow
+        // offset can only be known once the compositor has mapped the window).
+        updateContentSubPosition();
+        wl_surface_commit(s_rootSurface);
+        wl_display_flush(s_wlDisplay);
+    }
+#endif
 }
 
 int uiShouldQuit(void) {
@@ -141,16 +301,39 @@ int uiPopKey(void) {
 
 void uiWindowSize(uint32_t* w, uint32_t* h) {
     uint32_t pw = 0, ph = 0;
-    if (s_win != nullptr && gtk_widget_get_realized(s_win)) {
-        uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(s_win);
-        pw = (uint32_t)gtk_widget_get_width(s_win) * scale;
-        ph = (uint32_t)gtk_widget_get_height(s_win) * scale;
+    if (s_area != nullptr && gtk_widget_get_realized(s_area)) {
+        uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(s_area);
+        pw = (uint32_t)gtk_widget_get_width(s_area) * scale;
+        ph = (uint32_t)gtk_widget_get_height(s_area) * scale;
     }
     if (w) *w = pw;
     if (h) *h = ph;
+    if (pw != 0 && ph != 0 && !s_sizePrinted.exchange(true)) {
+        fprintf(stderr, "[window] size %ux%u header=%d\n", pw, ph, s_headerHeightPx);
+    }
 }
 
 void uiShutdown(void) {
+#ifdef GDK_WINDOWING_WAYLAND
+    // Destroy the bgfx-owned content surface only after bgfx has shut down.
+    if (s_contentSub != nullptr) {
+        wl_subsurface_destroy(s_contentSub);
+        s_contentSub = nullptr;
+    }
+    if (s_contentSurface != nullptr) {
+        wl_surface_destroy(s_contentSurface);
+        s_contentSurface = nullptr;
+    }
+    if (s_subcompositor != nullptr) {
+        wl_subcompositor_destroy(s_subcompositor);
+        s_subcompositor = nullptr;
+    }
+    if (s_compositor != nullptr) {
+        wl_compositor_destroy(s_compositor);
+        s_compositor = nullptr;
+    }
+    s_headerHeightPx = 0;
+#endif
     if (s_win != nullptr) {
         // The widget does not own the controller (it is not ref'd on add);
         // gtk_widget_remove_controller() performs the final unref, so we must
@@ -162,5 +345,7 @@ void uiShutdown(void) {
         }
         gtk_window_destroy(GTK_WINDOW(s_win));
         s_win = nullptr;
+        s_area = nullptr;
+        s_header = nullptr;
     }
 }

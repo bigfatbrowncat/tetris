@@ -166,10 +166,12 @@ public:
     bgfx::VertexLayout layout;
     std::vector<Vert> verts;
     uint32_t lastW = 0, lastH = 0;
+    uint32_t m_resetFlags = BGFX_RESET_VSYNC;
     bool ok = false;
     const bgfx::Caps* caps = nullptr;
 
     bool init(const UiWindow* win) {
+        m_resetFlags = (win->nwhType == UI_NWH_WAYLAND) ? 0 : BGFX_RESET_VSYNC;
         bgfx::Init init;
 #if BX_PLATFORM_OSX
         init.type = bgfx::RendererType::Count;   // auto-select -> Metal
@@ -182,7 +184,7 @@ public:
         init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
         init.resolution.width = 640;
         init.resolution.height = 640;
-        init.resolution.reset = BGFX_RESET_VSYNC;
+        init.resolution.reset = m_resetFlags;
         init.callback = &g_shotImpl;
         if (!bgfx::init(init)) {
             fprintf(stderr, "[tetris] bgfx init failed\n");
@@ -357,7 +359,7 @@ public:
     void render(const TetrisBackend::Snapshot& s, uint32_t pw, uint32_t ph) {
         if (!ok || pw == 0 || ph == 0) return;
         if (pw != lastW || ph != lastH) {
-            bgfx::reset(pw, ph, BGFX_RESET_VSYNC);
+            bgfx::reset(pw, ph, m_resetFlags);
             lastW = pw; lastH = ph;
         }
         verts.clear();
