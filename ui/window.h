@@ -26,6 +26,7 @@ enum {
 typedef struct {
 	uint32_t nwhType;   // UI_NWH_*
 	void*    nwh;
+	void*    ndt;      // native display: X11 Display* / Wayland wl_display* (or NULL)
 } UiWindow;
 
 // Create the UI toolkit (app + menu). Call once on the main thread.

@@ -75,9 +75,10 @@ void mtxOrtho(float* m, float l, float r, float b, float t,
     m[15] = 1.0f;
 }
 
-// Screenshot: bgfx hands us 4-byte BGRA pixels; we write a 24-bit BMP.
+// Screenshot: bgfx hands us 4-byte pixels (RGBA or BGRA depending on backend);
+// we write a 24-bit BMP (B G R order).
 void writeBmp(const char* path, uint32_t w, uint32_t h, uint32_t pitch,
-              const uint8_t* bgra, bool yflip) {
+              const uint8_t* data, bool yflip, bool isBgra) {
     uint32_t rowBytes = w * 3;
     uint32_t pad = (4 - (rowBytes % 4)) % 4;
     uint32_t stride = rowBytes + pad;
@@ -108,12 +109,18 @@ void writeBmp(const char* path, uint32_t w, uint32_t h, uint32_t pitch,
     for (uint32_t bmpRow = 0; bmpRow < h; bmpRow++) {
         // bottom-up BMP: row 0 is the image bottom
         uint32_t srcRow = yflip ? bmpRow : (h - 1 - bmpRow);
-        const uint8_t* src = bgra + (size_t)srcRow * pitch;
+        const uint8_t* src = data + (size_t)srcRow * pitch;
         for (uint32_t x = 0; x < w; x++) {
-            const uint8_t* p = src + (size_t)x * 4;  // B G R A
-            row[x * 3 + 0] = p[0];
-            row[x * 3 + 1] = p[1];
-            row[x * 3 + 2] = p[2];
+            const uint8_t* p = src + (size_t)x * 4;
+            if (isBgra) {  // p = B G R A
+                row[x * 3 + 0] = p[0];
+                row[x * 3 + 1] = p[1];
+                row[x * 3 + 2] = p[2];
+            } else {  // p = R G B A
+                row[x * 3 + 0] = p[2];
+                row[x * 3 + 1] = p[1];
+                row[x * 3 + 2] = p[0];
+            }
         }
         fwrite(row.data(), 1, stride, f);
     }
@@ -138,8 +145,9 @@ struct ShotCallback : bgfx::CallbackI {
     void captureEnd() override {}
     void captureFrame(const void*, uint32_t) override {}
     void screenShot(const char* _filePath, uint32_t _w, uint32_t _h, uint32_t _pitch,
-                    bgfx::TextureFormat::Enum, const void* _data, uint32_t, bool _yflip) override {
-        writeBmp(_filePath, _w, _h, _pitch, (const uint8_t*)_data, _yflip);
+                    bgfx::TextureFormat::Enum _format, const void* _data, uint32_t, bool _yflip) override {
+        bool isBgra = _format == bgfx::TextureFormat::BGRA8;
+        writeBmp(_filePath, _w, _h, _pitch, (const uint8_t*)_data, _yflip, isBgra);
     }
 };
 
@@ -170,7 +178,7 @@ public:
 #endif
         init.fallback = true;
         init.platformData.nwh = win->nwh;
-        init.platformData.ndt = nullptr;
+        init.platformData.ndt = win->ndt;
         init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
         init.resolution.width = 640;
         init.resolution.height = 640;

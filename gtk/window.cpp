@@ -73,7 +73,7 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     gtk_window_set_default_size(GTK_WINDOW(s_win), (int)w, (int)h);
 
     // A focusable child so the window reliably receives keyboard events.
-    GtkWidget* area = gtk_drawing_area_new();
+    GtkWidget* area = gtk_label_new("");
     gtk_widget_set_focusable(area, TRUE);
     gtk_window_set_child(GTK_WINDOW(s_win), area);
 
@@ -94,6 +94,7 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
 
     s_uiWindow.nwhType = UI_NWH_DEFAULT;
     s_uiWindow.nwh = nullptr;
+    s_uiWindow.ndt = nullptr;
     GdkSurface* surf = gtk_native_get_surface(GTK_NATIVE(s_win));
 #ifdef GDK_WINDOWING_X11
     if (surf && GDK_IS_X11_DISPLAY(gdk_display_get_default())) {
@@ -105,7 +106,10 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
 #endif
 #ifdef GDK_WINDOWING_WAYLAND
     if (surf && GDK_IS_WAYLAND_DISPLAY(gdk_display_get_default())) {
+        // bgfx's EGL display must come from the same wl_display that owns the
+        // wl_surface, otherwise wl_egl_window/surface creation fails.
         s_uiWindow.nwh = gdk_wayland_surface_get_wl_surface(GDK_SURFACE(surf));
+        s_uiWindow.ndt = gdk_wayland_display_get_wl_display(gdk_display_get_default());
         s_uiWindow.nwhType = UI_NWH_WAYLAND;
     }
 #endif

@@ -61,7 +61,7 @@ int main() {
     // Pump UI events until the frontend thread has torn down bgfx.
     // The actual rendering is driven by bgfx's own internal render thread —
     // we must NOT call bgfx::renderFrame() here (see the notes above).
-    while (!frontend.done()) {
+    while (!frontend.loopDone()) {
         uiPumpEvents(0.016);
         int k;
         while ((k = uiPopKey()) != KEY_NONE)
@@ -72,7 +72,8 @@ int main() {
         if (uiShouldQuit()) frontend.requestStop();
     }
 
-    gameThread.join();
     uiShutdown();
+    frontend.uiShutdownDone();
+    gameThread.join();
     return 0;
 }

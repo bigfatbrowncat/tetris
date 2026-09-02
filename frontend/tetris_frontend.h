@@ -16,6 +16,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -44,6 +45,8 @@ public:
     void setWindowSize(uint32_t pixelW, uint32_t pixelH);
     void requestStop();
     bool done() const;
+    bool loopDone() const;
+    void uiShutdownDone();
 
 private:
     TetrisBackend m_backend;
@@ -54,6 +57,10 @@ private:
     std::atomic<uint32_t> m_pxW{640}, m_pxH{640};
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_done{false};
+    std::atomic<bool> m_loopDone{false};
+    std::mutex m_shutdownMutex;
+    std::condition_variable m_shutdownCv;
+    bool m_uiShutdown{false};
 };
 
 }  // namespace tetris
