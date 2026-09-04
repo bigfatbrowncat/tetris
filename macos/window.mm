@@ -136,6 +136,16 @@ void uiWindowSize(uint32_t* w, uint32_t* h) {
     if (h) *h = s_pxH;
 }
 
+// macOS commits through the normal CALayer/Metal presentation path; nothing to
+// do here.
+void uiCommitFrame(void) {}
+
+// No separate content subsurface on macOS; the main loop's synchronous repaint
+// already keeps the canvas in lockstep with the window.
+void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData) {
+    (void)cb; (void)userData;
+}
+
 void uiShutdown(void) {
     if (s_app) [s_app terminate:nil];
 }

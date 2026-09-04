@@ -42,9 +42,17 @@ static TetrisBackend::Key toBackendKey(int k) {
         case KEY_DROP:    return TetrisBackend::Key::HardDrop;
         case KEY_PAUSE:   return TetrisBackend::Key::Pause;
         case KEY_RESTART: return TetrisBackend::Key::Restart;
-        case KEY_QUIT:    return TetrisBackend::Key::Quit;
-        default:          return TetrisBackend::Key::None;
+    case KEY_QUIT:    return TetrisBackend::Key::Quit;
+    default:          return TetrisBackend::Key::None;
     }
+}
+
+// Called from the UI layer's surface "layout" signal (frame clock LAYOUT phase)
+// on Wayland, BEFORE GTK commits the root surface (PAINT phase). Resize +
+// present the content synchronously so it lands in the same frame as the window
+// resize (no white strip). No-op if the size is unchanged.
+static void onFrameSync(uint32_t w, uint32_t h, void* user) {
+    static_cast<TetrisFrontend*>(user)->repaintSynchronous(w, h);
 }
 
 int main() {
@@ -56,11 +64,20 @@ int main() {
     }
 
     TetrisFrontend frontend;
+    uiSetFrameSyncCallback(&onFrameSync, &frontend);
     std::thread gameThread(&TetrisFrontend::run, &frontend, window);
 
     // Pump UI events until the frontend game loop has stopped. The actual
     // rendering is driven by bgfx's own internal render thread — we must NOT
     // call bgfx::renderFrame() here (see the notes above).
+    //
+    // Per-frame ordering (matters on Wayland, where the GL canvas is a
+    // subsurface that must not lag the committed window size):
+    //   1. uiPumpEvents  -> process events, update the allocation (NO commit)
+    //   2. repaintSync   -> resize the GL canvas to the new size, blocking until
+    //                        that frame is submitted (no-op if the size is unchanged)
+    //   3. uiCommitFrame -> commit the root surface (present the new window size)
+    // This keeps the canvas and the window in lockstep (no stray line on resize).
     while (!frontend.loopDone()) {
         uiPumpEvents(0.016);
         int k;
@@ -68,7 +85,8 @@ int main() {
             frontend.pushKey(toBackendKey(k));
         uint32_t pw, ph;
         uiWindowSize(&pw, &ph);
-        frontend.setWindowSize(pw, ph);
+        frontend.repaintSynchronous(pw, ph);
+        uiCommitFrame();
         if (uiShouldQuit()) frontend.requestStop();
     }
 

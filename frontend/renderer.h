@@ -1,6 +1,6 @@
 // ============================================================================
 //  Renderer — bgfx rendering of a TetrisBackend::Snapshot.
-//  (Metal on macOS, OpenGL on Linux — bgfx auto-selects.)
+//  (Metal on macOS, Vulkan on Linux — bgfx auto-selects.)
 //  ---------------------------------------------------------------------------
 //  Single dynamic vertex buffer, one draw call per frame. All drawing is
 //  derived from the Snapshot — this class knows nothing about game rules.
@@ -38,6 +38,11 @@ public:
 
     // End the frame (bgfx::frame).
     void endFrame();
+
+    // Block until the frame submitted by the preceding endFrame() has been
+    // presented to the native surface. Issues the extra bgfx::frame() calls
+    // that bgfx's multithreaded pipeline needs before that present is guaranteed.
+    void syncPresent();
 
     // Ask bgfx to write a screenshot (delivered via the CallbackI::screenShot).
     void requestScreenShot(const char* path);

@@ -43,6 +43,13 @@ public:
     // --- thread-safe UI-side API --------------------------------------------
     void pushKey(TetrisBackend::Key k);
     void setWindowSize(uint32_t pixelW, uint32_t pixelH);
+    // Force the game thread to reset bgfx to (pixelW, pixelH) and submit one
+    // frame, blocking the caller until that frame has actually been submitted.
+    // The UI layer calls this DURING a window resize (from the size-allocate
+    // callback, before the toolkit's render pass commits the new size) so the
+    // GL canvas resizes in the same frame as the window — no stray line while
+    // the old, smaller buffer is still on screen.
+    void repaintSynchronous(uint32_t pixelW, uint32_t pixelH);
     void requestStop();
     bool done() const;
     bool loopDone() const;
@@ -61,6 +68,25 @@ private:
     std::mutex m_shutdownMutex;
     std::condition_variable m_shutdownCv;
     bool m_uiShutdown{false};
+    // Wakes the game thread immediately on a resize so bgfx::reset() runs in
+    // the same frame as the window resize (avoids a visible gap while the old,
+    // smaller buffer is still up). The game thread waits on this with a 16 ms
+    // timeout, so normal frame pacing is unchanged.
+    std::mutex m_frameMutex;
+    std::condition_variable m_frameCv;
+    // Persistent "a resize is pending" flag used as the CV predicate. A plain
+    // notify can be lost if it lands between the game thread's render and its
+    // wait; the flag guarantees the new size is picked up on the very next frame.
+    std::atomic<bool> m_resizePending{false};
+    // Size last submitted by the game thread. repaintSynchronous() waits until
+    // this matches the requested size, guaranteeing the buffer resize has been
+    // committed before the caller (the UI render pass) proceeds.
+    std::atomic<uint32_t> m_lastRenderedW{0}, m_lastRenderedH{0};
+    std::mutex m_repaintMutex;
+    std::condition_variable m_repaintCv;
+    // Set by repaintSynchronous(); consumed by the game loop, which skips the
+    // gravity update for that frame (freezes the game while the canvas resizes).
+    std::atomic<bool> m_syncResize{false};
 };
 
 }  // namespace tetris

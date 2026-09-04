@@ -48,6 +48,23 @@ int uiPopKey(void);
 // Current drawable (pixel) size of the window content.
 void uiWindowSize(uint32_t* w, uint32_t* h);
 
+// Commit the frame (present the new window size to the compositor). On Wayland
+// this commits the root surface; on other backends it is a no-op. The UI loop
+// calls uiPumpEvents() (which updates the allocation but does NOT commit), then
+// resizes the GL canvas, then uiCommitFrame() — so the canvas and the window
+// are presented in the same frame.
+void uiCommitFrame(void);
+
+// Frame-sync hook. On Wayland the rendered content is a subsurface that must be
+// resized + presented BEFORE the toolkit commits the root surface (which happens
+// in the frame clock's PAINT phase). The UI layer calls cb() from the surface
+// "layout" signal (LAYOUT phase: after widget allocation, before PAINT) with the
+// new content size in pixels; cb() must resize + present the content
+// synchronously. On non-Wayland backends this is a no-op (the main loop's
+// repaintSynchronous + uiCommitFrame ordering already suffices).
+typedef void (*UiFrameSyncCallback)(uint32_t pixelW, uint32_t pixelH, void* userData);
+void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData);
+
 void uiShutdown(void);
 
 #ifdef __cplusplus

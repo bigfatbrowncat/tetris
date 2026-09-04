@@ -2,7 +2,7 @@
 """Compile the .sc shaders and emit C-embedded headers.
 
 macOS  -> Metal    headers in shaders/     (vs_quad.h / fs_quad.h)
-Linux  -> OpenGL   headers in shaders/gl/  (staged into the build dir by CMake)
+Linux  -> SPIR-V   headers in shaders/vk/  (staged into the build dir by CMake)
 """
 import os
 import subprocess
@@ -14,10 +14,11 @@ os.chdir(ROOT)
 
 IS_MACOS = sys.platform == "darwin"
 PLATFORM = "osx" if IS_MACOS else "linux"
-# bgfx's GL renderer strips any #version and prepends its own (#version 430
-# by default on Linux), so the GLSL profile must match that.
-PROFILE = "metal" if IS_MACOS else "430"
-OUT_DIR = "" if IS_MACOS else "gl/"
+# macOS renders via Metal; Linux renders via bgfx's Vulkan backend, so the
+# shaders compile to SPIR-V (profile "spirv" = SPIR-V 1.0 / Vulkan 1.0,
+# accepted by all drivers).
+PROFILE = "metal" if IS_MACOS else "spirv"
+OUT_DIR = "" if IS_MACOS else "vk/"
 TP_BIN = "osx-arm64/bin" if IS_MACOS else "linux64_gcc/bin"
 
 # BIN may be the build dir (as CMake sets it) or the shadercRelease

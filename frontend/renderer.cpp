@@ -1,4 +1,4 @@
-// Renderer implementation (bgfx, Metal).
+// Renderer implementation (bgfx; Metal on macOS, Vulkan on Linux).
 #include "renderer.h"
 
 #include "font.h"
@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -176,7 +177,7 @@ public:
 #if BX_PLATFORM_OSX
         init.type = bgfx::RendererType::Count;   // auto-select -> Metal
 #else
-        init.type = bgfx::RendererType::OpenGL;  // GLSL headers; auto would pick Vulkan
+        init.type = bgfx::RendererType::Vulkan;  // SPIR-V headers (shaders/vk/)
 #endif
         init.fallback = true;
         init.platformData.nwh = win->nwh;
@@ -186,6 +187,15 @@ public:
         init.resolution.height = 640;
         init.resolution.reset = m_resetFlags;
         init.callback = &g_shotImpl;
+        if (win->nwhType == UI_NWH_WAYLAND) {
+            // Mesa's Vulkan WSI uses the commit-timing protocol (wp_commit_timer_v1)
+            // to schedule commits in fifo (VSync) mode. Our resize path double-
+            // commits the content subsurface within a single vsync, which trips the
+            // compositor's "timestamp_exists" protocol error. Mailbox mode skips the
+            // commit-timer entirely, so the constraint (and the error) never apply.
+            // overwrite=0 so a user-supplied value still wins.
+            setenv("MESA_VK_WSI_PRESENT_MODE", "mailbox", 0);
+        }
         if (!bgfx::init(init)) {
             fprintf(stderr, "[tetris] bgfx init failed\n");
             return false;
@@ -229,6 +239,18 @@ public:
 
     void endFrame() {
         if (ok) bgfx::frame();
+    }
+
+    // Block until the frame most recently submitted via endFrame() has
+    // actually been presented to the native surface (its wl_surface commit
+    // flushed on Wayland). In bgfx's multithreaded mode frame N is presented
+    // by the internal render thread while processing frame N+1, so the
+    // present of frame N is only guaranteed once two further bgfx::frame()
+    // calls have returned.
+    void syncPresent() {
+        if (!ok) return;
+        bgfx::frame();
+        bgfx::frame();
     }
 
     void requestScreenShot(const char* path) {
@@ -389,6 +411,7 @@ bool Renderer::init(const UiWindow* win) { return m_impl->init(win); }
 void Renderer::shutdown() { m_impl->shutdown(); }
 void Renderer::render(const TetrisBackend::Snapshot& s, uint32_t w, uint32_t h) { m_impl->render(s, w, h); }
 void Renderer::endFrame() { m_impl->endFrame(); }
+void Renderer::syncPresent() { m_impl->syncPresent(); }
 void Renderer::requestScreenShot(const char* path) { m_impl->requestScreenShot(path); }
 
 }  // namespace tetris

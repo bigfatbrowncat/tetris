@@ -37,6 +37,8 @@ static int s_scale = 1;
 static std::atomic<bool> s_quit{false};
 static std::mutex s_keyMutex;
 static std::deque<int> s_keys;
+static UiFrameSyncCallback s_frameSyncCb = nullptr;
+static void* s_frameSyncUser = nullptr;
 
 #ifdef GDK_WINDOWING_WAYLAND
 static struct wl_compositor* s_compositor = nullptr;
@@ -82,6 +84,8 @@ static gboolean onCloseRequest(GtkWindow* win, gpointer user) {
     s_quit = true;  // block the raw close; the main loop performs a clean shutdown
     return TRUE;
 }
+
+
 
 #ifdef GDK_WINDOWING_WAYLAND
 static int onContentSurfaceDispatcher(const void* user_data, void* target,
@@ -134,6 +138,24 @@ static void onHeaderScaleFactorChanged(GObject* obj, GParamSpec* pspec, gpointer
         s_headerHeightPx = headerHeightPx(s_header);
     }
     updateContentSubPosition();
+}
+
+// Fired by the surface "layout" signal (frame clock LAYOUT phase). GTK's own
+// handler (GtkNative's surface_layout_cb) is connected before ours and performs
+// the widget allocation, so s_area already has the new size here. We resize +
+// present the content subsurface synchronously, BEFORE the PAINT phase commits
+// the root surface — so the content never lags the committed window size.
+static void onContentLayout(GdkSurface* surface, int width, int height, gpointer user) {
+    (void)surface; (void)width; (void)height; (void)user;
+    if (s_frameSyncCb == nullptr || s_contentSub == nullptr) return;
+    uint32_t w = 0, h = 0;
+    uiWindowSize(&w, &h);
+    if (w > 0 && h > 0) {
+        s_frameSyncCb(w, h, s_frameSyncUser);
+        // Re-align the subsurface (the CSD shadow offset can change on resize);
+        // the position takes effect with the content commit the callback just did.
+        updateContentSubPosition();
+    }
 }
 
 static void onRegistryGlobal(void* data, struct wl_registry* registry,
@@ -239,6 +261,11 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
         struct wl_surface* rootSurface = gdk_wayland_surface_get_wl_surface(GDK_SURFACE(surf));
         s_wlDisplay = wlDisplay;
         s_rootSurface = rootSurface;
+        // Resize + present the content subsurface in the LAYOUT phase (before
+        // the PAINT phase commits the root), keeping it in lockstep with the
+        // window size on resize. Connected after GtkNative's allocator so
+        // s_area is already at the new size when this runs.
+        g_signal_connect(surf, "layout", G_CALLBACK(onContentLayout), nullptr);
         bool globalsOk = (wlDisplay != nullptr) && bindWaylandGlobals(wlDisplay);
         if (wlDisplay != nullptr && rootSurface != nullptr && s_header != nullptr &&
             globalsOk) {
@@ -267,6 +294,10 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     return &s_uiWindow;
 }
 
+// Pump GTK events (and let the allocation update) WITHOUT committing the root
+// surface. The caller commits the frame via uiCommitFrame() only after it has
+// synchronously resized the GL canvas (see main.cpp), so the buffer resize and
+// the window resize are presented in the same frame.
 void uiPumpEvents(double timeoutSec) {
     GMainContext* ctx = g_main_context_default();
     gint64 deadline = g_get_monotonic_time() + (gint64)(timeoutSec * 1e6);
@@ -276,15 +307,26 @@ void uiPumpEvents(double timeoutSec) {
         else
             g_usleep(1000);
     } while (g_get_monotonic_time() < deadline);
+}
+
 #ifdef GDK_WINDOWING_WAYLAND
-    if (s_rootSurface != nullptr && s_wlDisplay != nullptr) {
-        // Keep the subsurface aligned with the content area (the CSD shadow
-        // offset can only be known once the compositor has mapped the window).
-        updateContentSubPosition();
-        wl_surface_commit(s_rootSurface);
-        wl_display_flush(s_wlDisplay);
-    }
+// Commit the root surface (and re-align the content subsurface). Call once per
+// frame, AFTER the GL canvas has been resized for the new size.
+void uiCommitFrame(void) {
+    if (s_rootSurface == nullptr || s_wlDisplay == nullptr) return;
+    // Keep the subsurface aligned with the content area (the CSD shadow offset
+    // can only be known once the compositor has mapped the window).
+    updateContentSubPosition();
+    wl_surface_commit(s_rootSurface);
+    wl_display_flush(s_wlDisplay);
+}
+#else
+void uiCommitFrame(void) {}
 #endif
+
+void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData) {
+    s_frameSyncCb = cb;
+    s_frameSyncUser = userData;
 }
 
 int uiShouldQuit(void) {

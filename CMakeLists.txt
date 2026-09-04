@@ -1,5 +1,5 @@
 # ============================================================================
-#  Tetris — cross-platform (bgfx; macOS Metal+Cocoa / Linux OpenGL+GTK4)
+#  Tetris — cross-platform (bgfx; macOS Metal+Cocoa / Linux Vulkan+GTK4)
 #  ---------------------------------------------------------------------------
 #  Modules:
 #    backend/   game logic, no UI / no OS          -> libtetrisback.a
@@ -66,14 +66,14 @@ elseif(UNIX)
     pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
     set(UI_SOURCES gtk/window.cpp)
     set(UI_LINK PkgConfig::GTK4 PkgConfig::WAYLAND_CLIENT)
-    # Committed OpenGL headers live in shaders/gl/; stage them in the build
+    # Committed SPIR-V headers live in shaders/vk/; stage them in the build
     # dir so the shared `#include "shaders/vs_quad.h"` in the frontend finds
     # them before the macOS ones in shaders/.
     set(GEN_SHADERS "${CMAKE_BINARY_DIR}/gen-shaders")
     set(PLATFORM_SHADERS_INC ${GEN_SHADERS})
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h")
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h")
         message(WARNING
-            "shaders/gl/*.h not found — run 'cmake --build build --target shaders' "
+            "shaders/vk/*.h not found — run 'cmake --build build --target shaders' "
             "(after tp_shaderc) before building the app.")
     endif()
 else()
@@ -116,7 +116,7 @@ set(SHADER_CMDS
     ENVIRONMENT "BIN=${TP_BIN}" "BGFX=${BGFX_ROOT}")
 
 if(NOT APPLE)
-    # The app build compiles against staged copies of the committed OpenGL
+    # The app build compiles against staged copies of the committed SPIR-V
     # headers (so the shared `#include "shaders/vs_quad.h"` resolves to them).
     set(GEN_SHADER_HDRS
         ${GEN_SHADERS}/shaders/vs_quad.h
@@ -125,12 +125,12 @@ if(NOT APPLE)
         OUTPUT ${GEN_SHADER_HDRS}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_SHADERS}/shaders
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h ${GEN_SHADERS}/shaders/
+                ${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h ${GEN_SHADERS}/shaders/
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/gl/fs_quad.h ${GEN_SHADERS}/shaders/
-        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h
-                ${CMAKE_SOURCE_DIR}/shaders/gl/fs_quad.h
-        COMMENT "[shaders] staging OpenGL headers"
+                ${CMAKE_SOURCE_DIR}/shaders/vk/fs_quad.h ${GEN_SHADERS}/shaders/
+        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h
+                ${CMAKE_SOURCE_DIR}/shaders/vk/fs_quad.h
+        COMMENT "[shaders] staging SPIR-V headers"
         VERBATIM)
     add_custom_target(gen_shaders DEPENDS ${GEN_SHADER_HDRS})
     add_dependencies(tetrisfront gen_shaders)
@@ -138,9 +138,9 @@ if(NOT APPLE)
     list(APPEND SHADER_CMDS
         COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_SHADERS}/shaders
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/gl/vs_quad.h ${GEN_SHADERS}/shaders/
+                ${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h ${GEN_SHADERS}/shaders/
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/gl/fs_quad.h ${GEN_SHADERS}/shaders/)
+                ${CMAKE_SOURCE_DIR}/shaders/vk/fs_quad.h ${GEN_SHADERS}/shaders/)
 endif()
 
 add_custom_target(shaders ${SHADER_CMDS}
