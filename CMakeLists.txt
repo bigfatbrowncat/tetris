@@ -102,7 +102,8 @@ target_include_directories(tetrisfront PUBLIC
     ${BX_ROOT}/include)
 target_link_libraries(tetrisfront PUBLIC
     tetrisback
-    bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
+    bgfxRelease bimgRelease bxRelease    # resolved via the link dir below
+    vulkan)                              # VK_KHR_wayland_surface mailbox detection
 target_link_directories(tetrisfront PUBLIC ${TP_BIN})
 add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)
 
@@ -157,6 +158,26 @@ add_executable(tetris
 target_link_libraries(tetris PRIVATE
     tetrisfront
     ${UI_LINK})
+
+# ----------------------------------------------------------------------------
+#  vulkan_resize_test — standalone bgfx + GTK4 + Vulkan + Wayland resize demo.
+#  Exercises the frame-clock-driven resize approach from
+#  docs/tips/gtk4-bgfx-vulkan-resize.md (BGFX_RESET_VSYNC == VK_PRESENT_MODE_FIFO)
+#  against the real compositor, to validate the FIFO path on this driver.
+# ----------------------------------------------------------------------------
+#if(NOT APPLE)
+#    add_executable(vulkan_resize_test vulkan_resize_test.cpp)
+#    target_include_directories(vulkan_resize_test PRIVATE
+#        ${BGFX_ROOT}/include
+#        ${BX_ROOT}/include)
+#    target_link_libraries(vulkan_resize_test PRIVATE
+#        bgfxRelease bimgRelease bxRelease
+#        PkgConfig::GTK4
+#        PkgConfig::WAYLAND_CLIENT
+#        vulkan)
+#    target_link_directories(vulkan_resize_test PRIVATE ${TP_BIN})
+#    add_dependencies(vulkan_resize_test tp_bx tp_bimg tp_bgfx)
+#endif()
 
 # ----------------------------------------------------------------------------
 #  distclean — remove ALL build artifacts: the app (equivalent to the

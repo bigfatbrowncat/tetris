@@ -7,10 +7,14 @@
 
 #include <bgfx/bgfx.h>
 
+#include <vulkan/vulkan.h>
+#include <vulkan/vulkan_wayland.h>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -156,6 +160,88 @@ ShotCallback g_shotImpl;
 
 struct Vert { float x, y, u, v, r, g, b; };
 
+// Probe the Vulkan WSI for the given Wayland surface. Returns whether any
+// physical device can present in VK_PRESENT_MODE_MAILBOX_KHR, plus the GPU
+// driver name (for the no-mailbox diagnostic). We open a throwaway VkInstance
+// with the surface + Wayland-surface extensions, build a VkSurfaceKHR over the
+// content wl_surface, query each physical device, then tear everything down.
+// Run BEFORE bgfx::init() so the result can select (or reject) the present mode.
+struct WsiProbe {
+    bool mailbox = false;
+    std::string driverName;
+};
+WsiProbe probeWsi(void* wlSurface, void* wlDisplay) {
+    WsiProbe result;
+    if (wlSurface == nullptr || wlDisplay == nullptr) return result;
+
+    uint32_t extCount = 0;
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr) != VK_SUCCESS) return result;
+    std::vector<VkExtensionProperties> extProps(extCount);
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &extCount, extProps.data()) != VK_SUCCESS) return result;
+
+    std::vector<const char*> reqExts;
+    bool hasSurface = false, hasWayland = false;
+    for (const auto& p : extProps) {
+        if (strcmp(p.extensionName, VK_KHR_SURFACE_EXTENSION_NAME) == 0) {
+            hasSurface = true;
+            reqExts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+        } else if (strcmp(p.extensionName, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME) == 0) {
+            hasWayland = true;
+            reqExts.push_back(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+        }
+    }
+    if (!hasSurface || !hasWayland) return result;
+
+    VkApplicationInfo appInfo{};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = "tetris";
+    appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
+    appInfo.pEngineName = "tetris";
+    appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    appInfo.apiVersion = VK_API_VERSION_1_0;
+
+    VkInstanceCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ci.pApplicationInfo = &appInfo;
+    ci.enabledExtensionCount = (uint32_t)reqExts.size();
+    ci.ppEnabledExtensionNames = reqExts.data();
+
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ci, nullptr, &instance) != VK_SUCCESS) return result;
+
+    std::vector<VkPhysicalDevice> devices;
+    uint32_t devCount = 0;
+    if (vkEnumeratePhysicalDevices(instance, &devCount, nullptr) == VK_SUCCESS && devCount > 0) {
+        devices.resize(devCount);
+        if (vkEnumeratePhysicalDevices(instance, &devCount, devices.data()) == VK_SUCCESS) {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(devices[0], &props);
+            result.driverName = props.deviceName;
+        }
+    }
+
+    VkWaylandSurfaceCreateInfoKHR si{};
+    si.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+    si.display = (struct wl_display*)wlDisplay;
+    si.surface = (struct wl_surface*)wlSurface;
+
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    if (vkCreateWaylandSurfaceKHR(instance, &si, nullptr, &surface) == VK_SUCCESS) {
+        for (uint32_t i = 0; i < devices.size() && !result.mailbox; ++i) {
+            uint32_t modeCount = 0;
+            if (vkGetPhysicalDeviceSurfacePresentModesKHR(devices[i], surface, &modeCount, nullptr) != VK_SUCCESS) continue;
+            std::vector<VkPresentModeKHR> modes(modeCount);
+            if (vkGetPhysicalDeviceSurfacePresentModesKHR(devices[i], surface, &modeCount, modes.data()) != VK_SUCCESS) continue;
+            for (auto m : modes) {
+                if (m == VK_PRESENT_MODE_MAILBOX_KHR) { result.mailbox = true; break; }
+            }
+        }
+        vkDestroySurfaceKHR(instance, surface, nullptr);
+    }
+    vkDestroyInstance(instance, nullptr);
+    return result;
+}
+
 }  // namespace
 
 class Renderer::Impl {
@@ -188,13 +274,28 @@ public:
         init.resolution.reset = m_resetFlags;
         init.callback = &g_shotImpl;
         if (win->nwhType == UI_NWH_WAYLAND) {
-            // Mesa's Vulkan WSI uses the commit-timing protocol (wp_commit_timer_v1)
-            // to schedule commits in fifo (VSync) mode. Our resize path double-
-            // commits the content subsurface within a single vsync, which trips the
-            // compositor's "timestamp_exists" protocol error. Mailbox mode skips the
-            // commit-timer entirely, so the constraint (and the error) never apply.
-            // overwrite=0 so a user-supplied value still wins.
-            setenv("MESA_VK_WSI_PRESENT_MODE", "mailbox", 0);
+            // The Vulkan spec (VK_KHR_wayland_surface, issue #2 / revision 6) REQUIRES
+            // Wayland implementations to expose VK_PRESENT_MODE_MAILBOX_KHR — Wayland
+            // is an inherently mailbox window system. So there is no FIFO fallback:
+            // probe for mailbox, force it, and fail loudly (with diagnostics) if a
+            // spec-compliant driver somehow doesn't expose it.
+            const WsiProbe probe = probeWsi(win->nwh, win->ndt);
+            if (probe.mailbox) {
+                fprintf(stderr, "[tetris] WSI present mode: mailbox (driver: %s)\n",
+                        probe.driverName.c_str());
+                setenv("MESA_VK_WSI_PRESENT_MODE", "mailbox", 0);
+            } else {
+                const char* server = (win->nwhType == UI_NWH_WAYLAND) ? "Wayland" : "X11";
+                fprintf(stderr,
+                    "[tetris] FATAL: VK_PRESENT_MODE_MAILBOX_KHR is not available on this system.\n"
+                    "        graphics server : %s\n"
+                    "        dri version     : dri3 (Vulkan)\n"
+                    "        driver          : %s\n"
+                    "        VK_PRESENT_MODE_MAILBOX_KHR is required on %s "
+                    "(mandated by VK_KHR_wayland_surface) but the driver does not expose it.\n",
+                    server, probe.driverName.c_str(), server);
+                return false;
+            }
         }
         if (!bgfx::init(init)) {
             fprintf(stderr, "[tetris] bgfx init failed\n");
