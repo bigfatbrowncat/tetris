@@ -250,6 +250,13 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"  // xid getter, still the only X11 API
         s_uiWindow.nwh = (void*)(uintptr_t)gdk_x11_surface_get_xid(GDK_SURFACE(surf));
+        // bgfx's Vulkan X11 path calls vkCreateXlibSurfaceKHR(dpy=ndt); a NULL
+        // dpy crashes the driver (it calls XGetXCBConnection() without a check).
+#if GTK_CHECK_VERSION(4, 18, 0)
+        s_uiWindow.ndt = gdk_x11_display_get_xdisplay(GDK_X11_DISPLAY(display));
+#else
+        s_uiWindow.ndt = gdk_x11_display_get_default_xdisplay();
+#endif
 #pragma GCC diagnostic pop
     }
 #endif
