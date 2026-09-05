@@ -258,7 +258,14 @@ public:
     const bgfx::Caps* caps = nullptr;
 
     bool init(const UiWindow* win) {
-        m_resetFlags = (win->nwhType == UI_NWH_WAYLAND) ? 0 : BGFX_RESET_VSYNC;
+#if BX_PLATFORM_OSX
+        m_resetFlags = BGFX_RESET_VSYNC;
+#else
+        // No vsync flag -> bgfx picks VK_PRESENT_MODE_IMMEDIATE_KHR: a frame is
+        // presented as soon as it is rendered, so a resize frame lands without
+        // waiting for the next vblank (no white strip / flicker on X11 resize).
+        m_resetFlags = 0;
+#endif
         bgfx::Init init;
 #if BX_PLATFORM_OSX
         init.type = bgfx::RendererType::Count;   // auto-select -> Metal
