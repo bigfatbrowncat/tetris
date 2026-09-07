@@ -60,7 +60,6 @@ if(APPLE)
         "-framework VideoToolbox")
     # Committed Metal headers in shaders/ are used directly.
     set(PLATFORM_SHADERS_INC "")
-    set(VULKAN_LIB "")
 elseif(UNIX)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
@@ -72,7 +71,6 @@ elseif(UNIX)
     # them before the macOS ones in shaders/.
     set(GEN_SHADERS "${CMAKE_BINARY_DIR}/gen-shaders")
     set(PLATFORM_SHADERS_INC ${GEN_SHADERS})
-    set(VULKAN_LIB vulkan)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h")
         message(WARNING
             "shaders/vk/*.h not found — run 'cmake --build build --target shaders' "
@@ -105,7 +103,7 @@ target_include_directories(tetrisfront PUBLIC
 target_link_libraries(tetrisfront PUBLIC
     tetrisback
     bgfxRelease bimgRelease bxRelease    # resolved via the link dir below
-    ${VULKAN_LIB})                        # VK_KHR_wayland_surface mailbox detection (Linux)
+    vulkan)                              # VK_KHR_wayland_surface mailbox detection
 target_link_directories(tetrisfront PUBLIC ${TP_BIN})
 add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)
 

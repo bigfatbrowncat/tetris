@@ -208,6 +208,21 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     gtk_window_set_child(GTK_WINDOW(s_win), s_area);
 
     GdkDisplay* display = gdk_display_get_default();
+#ifdef GDK_WINDOWING_X11
+    if (GDK_IS_X11_DISPLAY(display)) {
+        // X11 resize flicker: the X server fills newly-exposed areas with the
+        // window's background color while waiting for the next frame. GTK4 hides
+        // the legacy X11 background mechanism (there is no CWBackPixel to remove),
+        // so override the window node's background to transparent via CSS to stop
+        // the solid-color fill from being drawn.
+        // https://stackoverflow.com/questions/79926986
+        GtkCssProvider* cssProvider = gtk_css_provider_new();
+        gtk_css_provider_load_from_string(cssProvider, "window { background: transparent; }");
+        gtk_style_context_add_provider_for_display(
+            display, GTK_STYLE_PROVIDER(cssProvider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(cssProvider);
+    }
+#endif
 #ifdef GDK_WINDOWING_WAYLAND
     const bool wayland = GDK_IS_WAYLAND_DISPLAY(display);
     if (wayland) {
