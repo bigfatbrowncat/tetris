@@ -6,9 +6,12 @@
 #include "shaders/fs_quad.h"
 
 #include <bgfx/bgfx.h>
+#include <bx/platform.h>
 
+#if !BX_PLATFORM_OSX
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_wayland.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -160,6 +163,7 @@ ShotCallback g_shotImpl;
 
 struct Vert { float x, y, u, v, r, g, b; };
 
+#if !BX_PLATFORM_OSX
 // Probe the Vulkan WSI for the given Wayland surface. Returns whether any
 // physical device can present in VK_PRESENT_MODE_MAILBOX_KHR, plus the GPU
 // driver name (for the no-mailbox diagnostic). We open a throwaway VkInstance
@@ -241,6 +245,7 @@ WsiProbe probeWsi(void* wlSurface, void* wlDisplay) {
     vkDestroyInstance(instance, nullptr);
     return result;
 }
+#endif  // !BX_PLATFORM_OSX
 
 }  // namespace
 
@@ -280,6 +285,7 @@ public:
         init.resolution.height = 640;
         init.resolution.reset = m_resetFlags;
         init.callback = &g_shotImpl;
+#if !BX_PLATFORM_OSX
         if (win->nwhType == UI_NWH_WAYLAND) {
             // The Vulkan spec (VK_KHR_wayland_surface, issue #2 / revision 6) REQUIRES
             // Wayland implementations to expose VK_PRESENT_MODE_MAILBOX_KHR — Wayland
@@ -304,6 +310,7 @@ public:
                 return false;
             }
         }
+#endif  // !BX_PLATFORM_OSX
         if (!bgfx::init(init)) {
             fprintf(stderr, "[tetris] bgfx init failed\n");
             return false;
