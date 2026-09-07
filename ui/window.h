@@ -60,8 +60,12 @@ void uiCommitFrame(void);
 // in the frame clock's PAINT phase). The UI layer calls cb() from the surface
 // "layout" signal (LAYOUT phase: after widget allocation, before PAINT) with the
 // new content size in pixels; cb() must resize + present the content
-// synchronously. On non-Wayland backends this is a no-op (the main loop's
-// repaintSynchronous + uiCommitFrame ordering already suffices).
+// synchronously. On macOS the UI layer calls cb() from windowDidResize: so the
+// Metal canvas repaints inside the resize notification (continuous resizing
+// while dragging the window edge; the previous frame stays pinned top-left,
+// not stretched, until the new one is presented). On other backends this is a
+// no-op (the main loop's repaintSynchronous + uiCommitFrame ordering already
+// suffices).
 typedef void (*UiFrameSyncCallback)(uint32_t pixelW, uint32_t pixelH, void* userData);
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData);
 

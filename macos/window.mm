@@ -15,6 +15,8 @@ static std::mutex s_keyMutex;
 static std::deque<int> s_keys;
 static std::atomic<uint32_t> s_pxW{0};
 static std::atomic<uint32_t> s_pxH{0};
+static UiFrameSyncCallback s_frameSyncCb = nullptr;
+static void* s_frameSyncUser = nullptr;
 
 static int mapKey(unsigned short code) {
     switch (code) {
@@ -64,6 +66,12 @@ static void updatePixelSize() {
 - (void)windowDidResize:(NSNotification*)note {
     (void)note;
     updatePixelSize();
+    // Continuous resizing: repaint the new size synchronously, right inside the
+    // resize notification, instead of waiting for the pump loop's next
+    // iteration to catch up (docs/design/macos_metal_window_resizing.md).
+    // cb() blocks until the frame is presented, so the canvas lands in step
+    // with each drag increment.
+    if (s_frameSyncCb) s_frameSyncCb(s_pxW.load(), s_pxH.load(), s_frameSyncUser);
 }
 @end
 
@@ -93,7 +101,16 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
 
     TetrisView* view = [[TetrisView alloc] initWithFrame:rect];
     [view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    // While a resize is in flight (the new Metal frame has not been presented
+    // yet), pin the backing store to the top-left instead of letting Core
+    // Animation stretch the last presented frame to fill the window. The
+    // synchronous repaint in windowDidResize: replaces it within a frame.
+    view.layerContentsPlacement = NSViewLayerContentsPlacementTopLeft;
     [s_window setContentView:view];
+    // Where the pinned old frame no longer covers a grown window, the window
+    // background shows through. Match the renderer's clear color (0x101018 in
+    // frontend/renderer.cpp) so the gap during a resize is seamless.
+    [s_window setBackgroundColor:[NSColor colorWithSRGBRed:16.0/255.0 green:16.0/255.0 blue:24.0/255.0 alpha:1.0]];
 
     s_delegate = [[TetrisWinDelegate alloc] init];
     [s_window setDelegate:s_delegate];
@@ -140,10 +157,12 @@ void uiWindowSize(uint32_t* w, uint32_t* h) {
 // do here.
 void uiCommitFrame(void) {}
 
-// No separate content subsurface on macOS; the main loop's synchronous repaint
-// already keeps the canvas in lockstep with the window.
+// Frame-sync hook: windowDidResize: calls cb() with the new content pixel size
+// so the renderer repaints synchronously inside the resize notification
+// (continuous resizing while dragging the window edge).
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData) {
-    (void)cb; (void)userData;
+    s_frameSyncCb = cb;
+    s_frameSyncUser = userData;
 }
 
 void uiShutdown(void) {

@@ -49,7 +49,9 @@ void TetrisFrontend::repaintSynchronous(uint32_t w, uint32_t h) {
     m_frameCv.notify_all();
     std::unique_lock<std::mutex> lock(m_repaintMutex);
     m_repaintCv.wait(lock, [this, w, h] {
-        return m_lastRenderedW.load() == w && m_lastRenderedH.load() == h;
+        // m_loopDone: the game loop ended (quit) while we were waiting — a
+        // resize can race the shutdown; bail instead of blocking forever.
+        return (m_lastRenderedW.load() == w && m_lastRenderedH.load() == h) || m_loopDone.load();
     });
 }
 
@@ -140,6 +142,9 @@ void TetrisFrontend::run(const UiWindow* win) {
 
     m_backend.saveHighScore();
     m_loopDone.store(true);
+    // Wake any UI thread parked in repaintSynchronous() (a resize racing the
+    // shutdown); its predicate now sees m_loopDone.
+    m_repaintCv.notify_all();
     {
         std::unique_lock<std::mutex> lock(m_shutdownMutex);
         m_shutdownCv.wait(lock, [this] { return m_uiShutdown; });
