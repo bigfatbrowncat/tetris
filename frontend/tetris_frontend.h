@@ -42,13 +42,17 @@ public:
 
     // --- thread-safe UI-side API --------------------------------------------
     void pushKey(TetrisBackend::Key k);
+    // Update the target pixel size (non-blocking). If it changed, the game
+    // thread is woken so it resets bgfx + renders the new size on its next
+    // iteration. This is the resize path on Wayland, where the content is a
+    // subsurface that commits independently of the root (see main.cpp).
     void setWindowSize(uint32_t pixelW, uint32_t pixelH);
     // Force the game thread to reset bgfx to (pixelW, pixelH) and submit one
-    // frame, blocking the caller until that frame has actually been submitted.
-    // The UI layer calls this DURING a window resize (from the size-allocate
-    // callback, before the toolkit's render pass commits the new size) so the
-    // GL canvas resizes in the same frame as the window — no stray line while
-    // the old, smaller buffer is still on screen.
+    // frame, blocking the caller until that frame has actually been presented.
+    // Used by the backends where the canvas must land in the same frame as the
+    // window resize (X11, macOS): the UI layer calls this DURING a window
+    // resize so the GL canvas resizes in the same frame as the window — no
+    // stray line while the old, smaller buffer is still on screen.
     void repaintSynchronous(uint32_t pixelW, uint32_t pixelH);
     void requestStop();
     bool done() const;

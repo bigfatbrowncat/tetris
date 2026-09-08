@@ -47,12 +47,18 @@ static TetrisBackend::Key toBackendKey(int k) {
     }
 }
 
-// Called from the UI layer's surface "layout" signal (frame clock LAYOUT phase)
-// on Wayland, BEFORE GTK commits the root surface (PAINT phase). Resize +
-// present the content synchronously so it lands in the same frame as the window
-// resize (no white strip). No-op if the size is unchanged.
+// Wayland resizes the content asynchronously (see main()): the content is a
+// subsurface that the compositor keeps showing at its last committed size, and
+// the window background matches the renderer's clear color, so the root can
+// commit the new size immediately (no resize lag) while the content catches up
+// within a frame with no visible strip. Other backends block until the frame
+// is presented, keeping the canvas in the same frame as the window resize.
+static bool s_asyncResize = false;
+
 static void onFrameSync(uint32_t w, uint32_t h, void* user) {
-    static_cast<TetrisFrontend*>(user)->repaintSynchronous(w, h);
+    TetrisFrontend* fe = static_cast<TetrisFrontend*>(user);
+    if (s_asyncResize) fe->setWindowSize(w, h);
+    else fe->repaintSynchronous(w, h);
 }
 
 int main() {
@@ -63,6 +69,8 @@ int main() {
         return 1;
     }
 
+    s_asyncResize = (window->nwhType == UI_NWH_WAYLAND);
+
     TetrisFrontend frontend;
     uiSetFrameSyncCallback(&onFrameSync, &frontend);
     std::thread gameThread(&TetrisFrontend::run, &frontend, window);
@@ -71,13 +79,18 @@ int main() {
     // rendering is driven by bgfx's own internal render thread — we must NOT
     // call bgfx::renderFrame() here (see the notes above).
     //
-    // Per-frame ordering (matters on Wayland, where the GL canvas is a
-    // subsurface that must not lag the committed window size):
-    //   1. uiPumpEvents  -> process events, update the allocation (NO commit)
-    //   2. repaintSync   -> resize the GL canvas to the new size, blocking until
-    //                        that frame is submitted (no-op if the size is unchanged)
-    //   3. uiCommitFrame -> commit the root surface (present the new window size)
-    // This keeps the canvas and the window in lockstep (no stray line on resize).
+    // Per-frame ordering:
+    //   1. uiPumpEvents  -> process events, update the allocation. On Wayland
+    //                        the "layout" hook hands the new size to the game
+    //                        thread (non-blocking).
+    //   2. set/repaint   -> push the new size to the game thread.
+    //                        Wayland: setWindowSize() (async — the root commits
+    //                        the new size immediately; the subsurface catches up
+    //                        within a frame and the gap shows the matching window
+    //                        background). X11/macOS: repaintSynchronous() (blocks
+    //                        until the frame is presented, so the canvas and the
+    //                        window land in the same frame).
+    //   3. uiCommitFrame -> commit the root surface (Wayland).
     while (!frontend.loopDone()) {
         uiPumpEvents(0.016);
         int k;
@@ -85,7 +98,8 @@ int main() {
             frontend.pushKey(toBackendKey(k));
         uint32_t pw, ph;
         uiWindowSize(&pw, &ph);
-        frontend.repaintSynchronous(pw, ph);
+        if (s_asyncResize) frontend.setWindowSize(pw, ph);
+        else frontend.repaintSynchronous(pw, ph);
         uiCommitFrame();
         if (uiShouldQuit()) frontend.requestStop();
     }

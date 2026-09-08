@@ -21,6 +21,7 @@
 #include <atomic>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -88,14 +89,6 @@ static gboolean onCloseRequest(GtkWindow* win, gpointer user) {
 
 
 #ifdef GDK_WINDOWING_WAYLAND
-static int onContentSurfaceDispatcher(const void* user_data, void* target,
-                                      uint32_t opcode, const struct wl_message* msg,
-                                      union wl_argument* args) {
-    (void)user_data; (void)target; (void)msg; (void)args;
-    fprintf(stderr, "[window] content surface event opcode=%u\n", opcode);
-    return 0;
-}
-
 static int headerHeightPx(GtkWidget* header) {
     if (header == nullptr) return 0;
     uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(header);
@@ -115,6 +108,7 @@ static int headerHeightLogical(GtkWidget* header) {
 // (shadow + area_window_pos). bgfx renders at the origin of its own surface, so
 // the subsurface must be placed exactly at the content area's top-left.
 static void updateContentSubPosition() {
+    if (std::getenv("TETRIS_GAP_TEST")) return;  // TEMP-TEST: keep the gap offset
     if (s_contentSub == nullptr || s_win == nullptr || s_area == nullptr) return;
     if (!gtk_widget_get_realized(s_win) || !gtk_widget_get_realized(s_area)) return;
     double stx = 0.0, sty = 0.0;
@@ -142,20 +136,54 @@ static void onHeaderScaleFactorChanged(GObject* obj, GParamSpec* pspec, gpointer
 
 // Fired by the surface "layout" signal (frame clock LAYOUT phase). GTK's own
 // handler (GtkNative's surface_layout_cb) is connected before ours and performs
-// the widget allocation, so s_area already has the new size here. We resize +
-// present the content subsurface synchronously, BEFORE the PAINT phase commits
-// the root surface — so the content never lags the committed window size.
+// the widget allocation, so s_area already has the new size here. Hand the new
+// size to the game thread (non-blocking on Wayland): the root commits the new
+// size immediately in the PAINT phase — no resize lag — and the content
+// subsurface catches up within a frame. The one-frame gap shows the window
+// background, which matches the renderer's clear color, so it is invisible.
 static void onContentLayout(GdkSurface* surface, int width, int height, gpointer user) {
     (void)surface; (void)width; (void)height; (void)user;
     if (s_frameSyncCb == nullptr || s_contentSub == nullptr) return;
     uint32_t w = 0, h = 0;
     uiWindowSize(&w, &h);
     if (w > 0 && h > 0) {
+        // TEMP-TEST: measure the handler cost (must be non-blocking).
+        const gint64 t0 = g_get_monotonic_time();
         s_frameSyncCb(w, h, s_frameSyncUser);
         // Re-align the subsurface (the CSD shadow offset can change on resize);
-        // the position takes effect with the content commit the callback just did.
+        // the position takes effect with the next content commit.
         updateContentSubPosition();
+        fprintf(stderr, "[window] layout cb cost %g us (size %ux%u)\n",
+                (g_get_monotonic_time() - t0) / 1000.0, w, h);
     }
+}
+
+// TEMP-TEST: TETRIS_RESIZE_TEST grows the window 640->1240 in steps (like a
+// drag), releases the constraint, then maximizes (big grow) and unmaximizes
+// (big shrink back) to exercise both directions.
+static gboolean resizeTestTick(gpointer user) {
+    (void)user;
+    static int step = 0;
+    GtkWindow* win = GTK_WINDOW(s_win);
+    switch (step) {
+        case 24:
+            gtk_widget_set_size_request(GTK_WIDGET(win), -1, -1);  // release the constraint
+            break;
+        case 25:
+            gtk_window_maximize(win);                  // big grow
+            break;
+        case 27:
+            gtk_window_unmaximize(win);                // big shrink
+            break;
+        default:
+            if (step < 24) {
+                const int t = step * 600 / 23;
+                gtk_widget_set_size_request(GTK_WIDGET(win), 640 + t, 640 + t);
+            }
+            break;
+    }
+    step++;
+    return step <= 28 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
 }
 
 static void onRegistryGlobal(void* data, struct wl_registry* registry,
@@ -228,6 +256,16 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     if (wayland) {
         g_setenv("GSK_RENDERER", "cairo", TRUE);
         g_setenv("GDK_GL_DISABLE", "1", TRUE);
+        // The bgfx content is a subsurface that lags the root by up to one
+        // frame during a resize; the newly exposed area shows this window
+        // background. Match the renderer's clear color (0x101018,
+        // frontend/renderer.cpp) so the one-frame gap is invisible (no strip /
+        // flicker) — same trick as macos/window.mm.
+        GtkCssProvider* cssProvider = gtk_css_provider_new();
+        gtk_css_provider_load_from_string(cssProvider, "window { background: #101018; }");
+        gtk_style_context_add_provider_for_display(
+            display, GTK_STYLE_PROVIDER(cssProvider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(cssProvider);
         s_header = gtk_header_bar_new();
         GtkWidget* titleLabel = gtk_label_new(title);
         gtk_header_bar_set_title_widget(GTK_HEADER_BAR(s_header), titleLabel);
@@ -252,8 +290,9 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
 
     // Pump until the window is realized and the content child has an allocation.
     for (int i = 0; i < 200 &&
-         (!gtk_widget_get_realized(s_win) || gtk_widget_get_height(s_area) == 0); i++)
+          (!gtk_widget_get_realized(s_win) || gtk_widget_get_height(s_area) == 0); i++)
         uiPumpEvents(0.005);
+    if (std::getenv("TETRIS_RESIZE_TEST")) g_timeout_add(100, resizeTestTick, nullptr);
 
     s_uiWindow.nwhType = UI_NWH_DEFAULT;
     s_uiWindow.nwh = nullptr;
@@ -283,10 +322,10 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
         struct wl_surface* rootSurface = gdk_wayland_surface_get_wl_surface(GDK_SURFACE(surf));
         s_wlDisplay = wlDisplay;
         s_rootSurface = rootSurface;
-        // Resize + present the content subsurface in the LAYOUT phase (before
-        // the PAINT phase commits the root), keeping it in lockstep with the
-        // window size on resize. Connected after GtkNative's allocator so
-        // s_area is already at the new size when this runs.
+        // Hand the new size to the game thread in the LAYOUT phase (before the
+        // PAINT phase commits the root), so the content resize is requested as
+        // early as possible. Connected after GtkNative's allocator so s_area is
+        // already at the new size when this runs.
         g_signal_connect(surf, "layout", G_CALLBACK(onContentLayout), nullptr);
         bool globalsOk = (wlDisplay != nullptr) && bindWaylandGlobals(wlDisplay);
         if (wlDisplay != nullptr && rootSurface != nullptr && s_header != nullptr &&
@@ -297,10 +336,10 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
                                                            rootSurface);
             s_headerHeightPx = headerHeightPx(s_header);
             wl_surface_set_buffer_scale(s_contentSurface, (int32_t)s_scale);
-            wl_subsurface_set_position(s_contentSub, 0, (int32_t)headerHeightLogical(s_header));
+            int gapY = (int)headerHeightLogical(s_header);
+            if (std::getenv("TETRIS_GAP_TEST")) gapY += 100;  // TEMP-TEST: 100px band
+            wl_subsurface_set_position(s_contentSub, 0, gapY);
             wl_subsurface_place_above(s_contentSub, rootSurface);
-            wl_proxy_add_dispatcher((struct wl_proxy*)s_contentSurface,
-                                    onContentSurfaceDispatcher, nullptr, nullptr);
             fprintf(stderr, "[window] content surface created scale=%d headerLogical=%d headerPx=%d\n",
                     s_scale, headerHeightLogical(s_header), s_headerHeightPx);
             wl_surface_commit(rootSurface);
@@ -317,9 +356,8 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
 }
 
 // Pump GTK events (and let the allocation update) WITHOUT committing the root
-// surface. The caller commits the frame via uiCommitFrame() only after it has
-// synchronously resized the GL canvas (see main.cpp), so the buffer resize and
-// the window resize are presented in the same frame.
+// surface. The caller commits the frame via uiCommitFrame() after pushing the
+// new size to the renderer (see main.cpp).
 void uiPumpEvents(double timeoutSec) {
     GMainContext* ctx = g_main_context_default();
     gint64 deadline = g_get_monotonic_time() + (gint64)(timeoutSec * 1e6);
@@ -333,7 +371,9 @@ void uiPumpEvents(double timeoutSec) {
 
 #ifdef GDK_WINDOWING_WAYLAND
 // Commit the root surface (and re-align the content subsurface). Call once per
-// frame, AFTER the GL canvas has been resized for the new size.
+// frame. The content subsurface is committed independently by the renderer's
+// thread, so this presents the new window size immediately; the content
+// catches up within a frame (the gap shows the matching window background).
 void uiCommitFrame(void) {
     if (s_rootSurface == nullptr || s_wlDisplay == nullptr) return;
     // Keep the subsurface aligned with the content area (the CSD shadow offset

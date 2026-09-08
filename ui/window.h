@@ -49,21 +49,23 @@ int uiPopKey(void);
 void uiWindowSize(uint32_t* w, uint32_t* h);
 
 // Commit the frame (present the new window size to the compositor). On Wayland
-// this commits the root surface; on other backends it is a no-op. The UI loop
-// calls uiPumpEvents() (which updates the allocation but does NOT commit), then
-// resizes the GL canvas, then uiCommitFrame() — so the canvas and the window
-// are presented in the same frame.
+// this commits the root surface; on other backends it is a no-op. On Wayland
+// the content (a subsurface committed independently by the renderer) may lag
+// this commit by up to one frame; the window background matches the
+// renderer's clear color, so the gap is invisible.
 void uiCommitFrame(void);
 
-// Frame-sync hook. On Wayland the rendered content is a subsurface that must be
-// resized + presented BEFORE the toolkit commits the root surface (which happens
-// in the frame clock's PAINT phase). The UI layer calls cb() from the surface
-// "layout" signal (LAYOUT phase: after widget allocation, before PAINT) with the
-// new content size in pixels; cb() must resize + present the content
-// synchronously. On macOS the UI layer calls cb() from windowDidResize: so the
-// Metal canvas repaints inside the resize notification (continuous resizing
-// while dragging the window edge; the previous frame stays pinned top-left,
-// not stretched, until the new one is presented). On other backends this is a
+// Frame-sync hook. On Wayland the rendered content is a subsurface committed
+// independently of the root; the UI layer calls cb() from the surface "layout"
+// signal (LAYOUT phase: after widget allocation, before PAINT) with the new
+// content size in pixels. cb() hands the size to the renderer, which resizes +
+// commits the subsurface asynchronously — the root commits the new size
+// immediately (no resize lag) and the window background (matched to the
+// renderer's clear color) covers the gap until the content lands. On macOS the
+// UI layer calls cb() from windowDidResize: so the Metal canvas repaints
+// synchronously inside the resize notification (continuous resizing while
+// dragging the window edge; the previous frame stays pinned top-left, not
+// stretched, until the new one is presented). On other backends this is a
 // no-op (the main loop's repaintSynchronous + uiCommitFrame ordering already
 // suffices).
 typedef void (*UiFrameSyncCallback)(uint32_t pixelW, uint32_t pixelH, void* userData);
