@@ -27,6 +27,10 @@ typedef struct {
 	uint32_t nwhType;   // UI_NWH_*
 	void*    nwh;
 	void*    ndt;      // native display: X11 Display* / Wayland wl_display* (or NULL)
+	// 1: the renderer runs headless (nwh/ndt unused) and publishes each frame as
+	// raw BGRA8 pixels via uiPushFrame(); the UI layer presents them (GTK draws
+	// them into a GtkDrawingArea). 0: the renderer presents to nwh directly.
+	uint32_t offscreen;
 } UiWindow;
 
 // Create the UI toolkit (app + menu). Call once on the main thread.
@@ -70,6 +74,18 @@ void uiCommitFrame(void);
 // suffices).
 typedef void (*UiFrameSyncCallback)(uint32_t pixelW, uint32_t pixelH, void* userData);
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData);
+
+// Offscreen frame handoff (renderer runs headless, publishes raw pixels).
+//
+// uiPushFrame(): call from the game thread after the renderer has read back a
+// frame. w/h are in device pixels, bgra points at w*h*4 bytes in B,G,R,A
+// order, top row first. The UI layer copies it; bgra may be reused/freed
+// after the call returns.
+void uiPushFrame(uint32_t w, uint32_t h, const uint8_t* bgra);
+
+// uiPresentFrame(): call from the main thread each frame; asks the UI layer to
+// repaint with the latest pushed frame if one is pending.
+void uiPresentFrame(void);
 
 void uiShutdown(void);
 

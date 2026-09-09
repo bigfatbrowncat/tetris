@@ -157,6 +157,13 @@ void uiWindowSize(uint32_t* w, uint32_t* h) {
 // do here.
 void uiCommitFrame(void) {}
 
+// Offscreen frame handoff: unused on macOS (offscreen == 0, the renderer
+// presents to the window directly).
+void uiPushFrame(uint32_t w, uint32_t h, const uint8_t* bgra) {
+    (void)w; (void)h; (void)bgra;
+}
+void uiPresentFrame(void) {}
+
 // Frame-sync hook: windowDidResize: calls cb() with the new content pixel size
 // so the renderer repaints synchronously inside the resize notification
 // (continuous resizing while dragging the window edge).

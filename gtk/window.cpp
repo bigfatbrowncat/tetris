@@ -1,57 +1,59 @@
 // GTK4 implementation of the platform-neutral UI layer (ui/window.h).
-// X11 and Wayland are both supported: the native handle (XID / wl_surface)
-// is extracted once the window is realized.
+// X11 and Wayland are both supported. The renderer runs headless (offscreen):
+// it publishes each frame as raw BGRA8 pixels via uiPushFrame(), and we draw
+// them into a GtkDrawingArea. The window's whole content is that drawing area,
+// so there is no native handle to extract and no independent surface to commit.
+//
+// Resizing: onDraw() is non-blocking and always covers the full allocation —
+// first the renderer's clear color, then the latest published frame pinned
+// top-left and clipped to the area. So a freshly exposed strip is covered by
+// the clear color (which matches the scene background) immediately, with no
+// desktop gap; the game thread renders the new size on its own schedule and
+// the next draw shows it at full size.
 #include <gtk/gtk.h>
-#ifdef GDK_WINDOWING_X11
-#if GTK_CHECK_VERSION(4, 18, 0)
-#include <gdk/x11/gdkx.h>
-#else
-#include <gtk/gtk-x11.h>
-#endif
-#endif
 #ifdef GDK_WINDOWING_WAYLAND
 #if GTK_CHECK_VERSION(4, 18, 0)
 #include <gdk/wayland/gdkwayland.h>
 #else
 #include <gtk/gtk-wayland.h>
 #endif
-#include <wayland-client.h>
 #endif
 
 #include <atomic>
-#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <vector>
 #include "ui/window.h"
 
 static GtkWidget* s_win = nullptr;
 static GtkWidget* s_area = nullptr;
 static GtkWidget* s_header = nullptr;
-static GdkSurface* s_gdkSurface = nullptr;
 static GtkEventController* s_keyCtrl = nullptr;
 static UiWindow s_uiWindow = {UI_NWH_DEFAULT, nullptr};
 static int s_headerHeightPx = 0;
-static int s_scale = 1;
 static std::atomic<bool> s_quit{false};
 static std::mutex s_keyMutex;
 static std::deque<int> s_keys;
+static std::atomic<bool> s_sizePrinted{false};
 static UiFrameSyncCallback s_frameSyncCb = nullptr;
 static void* s_frameSyncUser = nullptr;
 
-#ifdef GDK_WINDOWING_WAYLAND
-static struct wl_compositor* s_compositor = nullptr;
-static struct wl_subcompositor* s_subcompositor = nullptr;
-static struct wl_surface* s_contentSurface = nullptr;
-static struct wl_subsurface* s_contentSub = nullptr;
-static struct wl_surface* s_rootSurface = nullptr;
-static struct wl_display* s_wlDisplay = nullptr;
-static int s_subPosX = INT_MIN;
-static int s_subPosY = INT_MIN;
-static std::atomic<bool> s_sizePrinted{false};
-#endif
+// Latest frame published by the game thread (raw BGRA8, top row first) and the
+// UI-thread's persistent cairo surface that presents it.
+struct FrameStore {
+    std::mutex mu;
+    std::vector<uint8_t> buf;   // BGRA pixels (written by the game thread)
+    uint32_t w = 0, h = 0;
+    uint64_t seq = 0;           // incremented on each uiPushFrame
+    uint64_t presented = 0;    // last seq drawn by onDraw
+    // UI-thread-owned, updated per draw; recreated when the frame size changes.
+    cairo_surface_t* surf = nullptr;
+    uint32_t surfW = 0, surfH = 0;
+};
+static FrameStore s_frame;
 
 static int mapKey(guint keyval) {
     switch (keyval) {
@@ -69,7 +71,7 @@ static int mapKey(guint keyval) {
 }
 
 static gboolean onKeyPressed(GtkEventControllerKey* ctrl, guint keyval,
-                             guint code, GdkModifierType state, gpointer user) {
+                              guint code, GdkModifierType state, gpointer user) {
     (void)ctrl; (void)code; (void)state; (void)user;
     int k = mapKey(keyval);
     if (k != KEY_NONE) {
@@ -86,44 +88,11 @@ static gboolean onCloseRequest(GtkWindow* win, gpointer user) {
     return TRUE;
 }
 
-
-
 #ifdef GDK_WINDOWING_WAYLAND
 static int headerHeightPx(GtkWidget* header) {
     if (header == nullptr) return 0;
     uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(header);
-    s_scale = (int)scale;
     return (int)(gtk_widget_get_height(header) * (int64_t)scale + 0.5);
-}
-
-static int headerHeightLogical(GtkWidget* header) {
-    if (header == nullptr) return 0;
-    return (int)gtk_widget_get_height(header);
-}
-
-// The subsurface is positioned in the toplevel wl_surface's coordinate space,
-// whose origin is the outer edge of the CSD shadow -- not the visible window.
-// gtk_native_get_surface_transform() gives the shadow offset (surface origin ->
-// widget origin), so the content area (below the header) sits at
-// (shadow + area_window_pos). bgfx renders at the origin of its own surface, so
-// the subsurface must be placed exactly at the content area's top-left.
-static void updateContentSubPosition() {
-    if (std::getenv("TETRIS_GAP_TEST")) return;  // TEMP-TEST: keep the gap offset
-    if (s_contentSub == nullptr || s_win == nullptr || s_area == nullptr) return;
-    if (!gtk_widget_get_realized(s_win) || !gtk_widget_get_realized(s_area)) return;
-    double stx = 0.0, sty = 0.0;
-    gtk_native_get_surface_transform(GTK_NATIVE(s_win), &stx, &sty);
-    gdouble ax = 0.0, ay = 0.0;
-    gtk_widget_translate_coordinates(s_area, s_win, 0, 0, &ax, &ay);
-    int px = (int)(stx + ax);
-    int py = (int)(sty + ay);
-    if (px != s_subPosX || py != s_subPosY) {
-        fprintf(stderr, "[window] subsurface pos -> (%d, %d) [shadow (%.0f, %.0f) + area (%.0f, %.0f)]\n",
-                px, py, stx, sty, ax, ay);
-        wl_subsurface_set_position(s_contentSub, (int32_t)px, (int32_t)py);
-        s_subPosX = px;
-        s_subPosY = py;
-    }
 }
 
 static void onHeaderScaleFactorChanged(GObject* obj, GParamSpec* pspec, gpointer user) {
@@ -131,32 +100,8 @@ static void onHeaderScaleFactorChanged(GObject* obj, GParamSpec* pspec, gpointer
     if (s_header != nullptr) {
         s_headerHeightPx = headerHeightPx(s_header);
     }
-    updateContentSubPosition();
 }
-
-// Fired by the surface "layout" signal (frame clock LAYOUT phase). GTK's own
-// handler (GtkNative's surface_layout_cb) is connected before ours and performs
-// the widget allocation, so s_area already has the new size here. Hand the new
-// size to the game thread (non-blocking on Wayland): the root commits the new
-// size immediately in the PAINT phase — no resize lag — and the content
-// subsurface catches up within a frame. The one-frame gap shows the window
-// background, which matches the renderer's clear color, so it is invisible.
-static void onContentLayout(GdkSurface* surface, int width, int height, gpointer user) {
-    (void)surface; (void)width; (void)height; (void)user;
-    if (s_frameSyncCb == nullptr || s_contentSub == nullptr) return;
-    uint32_t w = 0, h = 0;
-    uiWindowSize(&w, &h);
-    if (w > 0 && h > 0) {
-        // TEMP-TEST: measure the handler cost (must be non-blocking).
-        const gint64 t0 = g_get_monotonic_time();
-        s_frameSyncCb(w, h, s_frameSyncUser);
-        // Re-align the subsurface (the CSD shadow offset can change on resize);
-        // the position takes effect with the next content commit.
-        updateContentSubPosition();
-        fprintf(stderr, "[window] layout cb cost %g us (size %ux%u)\n",
-                (g_get_monotonic_time() - t0) / 1000.0, w, h);
-    }
-}
+#endif
 
 // TEMP-TEST: TETRIS_RESIZE_TEST grows the window 640->1240 in steps (like a
 // drag), releases the constraint, then maximizes (big grow) and unmaximizes
@@ -186,40 +131,66 @@ static gboolean resizeTestTick(gpointer user) {
     return step <= 28 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
 }
 
-static void onRegistryGlobal(void* data, struct wl_registry* registry,
-                              uint32_t name, const char* interface,
-                              uint32_t version) {
-    (void)data;
-    if (interface == nullptr) return;
-    if (strcmp(interface, "wl_compositor") == 0) {
-        s_compositor = (struct wl_compositor*)wl_registry_bind(registry, name,
-                                                                &wl_compositor_interface, version);
-    } else if (strcmp(interface, "wl_subcompositor") == 0) {
-        s_subcompositor = (struct wl_subcompositor*)wl_registry_bind(registry, name,
-                                                                     &wl_subcompositor_interface, version);
+// Draw callback (GTK_PAINT). width/height are logical pixels; cr is pre-scaled
+// by the scale factor. We paint a device-size frame 1:1 in device pixels, so we
+// undo that scaling for the frame. The clear-color underlay covers the full
+// allocation first (see the file header).
+static void onDraw(GtkDrawingArea* area, cairo_t* cr, int width, int height, gpointer user) {
+    (void)user;
+    uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(GTK_WIDGET(area));
+    uint32_t devW = (uint32_t)width * scale;
+    uint32_t devH = (uint32_t)height * scale;
+
+    // 1) Cover the whole allocation with the renderer's clear color, so a
+    //    freshly exposed strip never shows the desktop (no gap).
+    cairo_set_source_rgb(cr, 16.0 / 255.0, 16.0 / 255.0, 24.0 / 255.0);
+    cairo_paint(cr);
+
+    // 2) Draw the latest published frame at native size, pinned top-left and
+    //    clipped to the area (1:1 device pixels -> undo the scale factor).
+    //    The frame is BGRA8; we convert it to an opaque CAIRO_FORMAT_RGB24
+    //    surface (bytes B,G,R, no alpha). The scene is fully opaque, and an
+    //    explicit opaque format avoids any premultiplied-alpha misinterpretation
+    //    of the straight-alpha readback bytes by the GSK renderer.
+    cairo_surface_t* surf = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(s_frame.mu);
+        if (s_frame.seq != 0 && s_frame.buf.size() == (size_t)s_frame.w * s_frame.h * 4) {
+            if (s_frame.surf == nullptr || s_frame.surfW != s_frame.w ||
+                s_frame.surfH != s_frame.h) {
+                // Drops our reference only; any in-flight GSK reference keeps the
+                // old surface alive until that frame has rendered.
+                if (s_frame.surf != nullptr) cairo_surface_destroy(s_frame.surf);
+                s_frame.surf = cairo_image_surface_create(CAIRO_FORMAT_RGB24,
+                                                          s_frame.w, s_frame.h);
+                s_frame.surfW = s_frame.w;
+                s_frame.surfH = s_frame.h;
+            }
+            // RGB24 is a 32-bit format: 4 bytes/pixel laid out [B,G,R,0]. Our
+            // BGRA frame is [B,G,R,A]. A straight memcpy lands B,G,R correctly;
+            // cairo ignores the 4th byte of an RGB24 surface (no alpha), so the
+            // carried-over A is harmless. (Writing 3 bytes/pixel here would
+            // misalign against cairo's 4-byte stride and scramble the colors.)
+            memcpy(cairo_image_surface_get_data(s_frame.surf), s_frame.buf.data(),
+                   s_frame.buf.size());
+            surf = s_frame.surf;
+            s_frame.presented = s_frame.seq;
+        }
+    }
+    if (surf != nullptr) {
+        cairo_scale(cr, 1.0 / (double)scale, 1.0 / (double)scale);
+        cairo_set_source_surface(cr, surf, 0, 0);
+        cairo_paint(cr);
+        // surf is persistent (owned by s_frame); GSK holds its own reference
+        // until the frame has rendered, so we do not destroy it here.
+    }
+
+    // 3) Hand the new size to the game thread (non-blocking) so it renders this
+    //    size on its next iteration.
+    if (s_frameSyncCb != nullptr) {
+        s_frameSyncCb(devW, devH, s_frameSyncUser);
     }
 }
-
-static void onRegistryGlobalRemove(void* data, struct wl_registry* registry,
-                                   uint32_t name) {
-    (void)data; (void)registry; (void)name;
-}
-
-static bool bindWaylandGlobals(struct wl_display* wlDisplay) {
-    if (s_compositor != nullptr && s_subcompositor != nullptr) return true;
-    struct wl_registry* registry = wl_display_get_registry(wlDisplay);
-    if (registry == nullptr) return false;
-
-    struct wl_registry_listener listener = {};
-    listener.global = onRegistryGlobal;
-    listener.global_remove = onRegistryGlobalRemove;
-    wl_registry_add_listener(registry, &listener, nullptr);
-    wl_display_roundtrip(wlDisplay);
-    wl_registry_destroy(registry);
-
-    return s_compositor != nullptr && s_subcompositor != nullptr;
-}
-#endif
 
 void uiInit(void) {
     gtk_init();
@@ -230,48 +201,34 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     gtk_window_set_title(GTK_WINDOW(s_win), title);
     gtk_window_set_default_size(GTK_WINDOW(s_win), (int)w, (int)h);
 
-    // A focusable child so the window reliably receives keyboard events.
-    s_area = gtk_label_new("");
+    // The whole content is a drawing area that presents the frames the
+    // (headless) renderer publishes.
+    s_area = gtk_drawing_area_new();
     gtk_widget_set_focusable(s_area, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(s_area), onDraw, nullptr, nullptr);
     gtk_window_set_child(GTK_WINDOW(s_win), s_area);
 
     GdkDisplay* display = gdk_display_get_default();
-#ifdef GDK_WINDOWING_X11
-    if (GDK_IS_X11_DISPLAY(display)) {
-        // X11 resize flicker: the X server fills newly-exposed areas with the
-        // window's background color while waiting for the next frame. GTK4 hides
-        // the legacy X11 background mechanism (there is no CWBackPixel to remove),
-        // so override the window node's background to transparent via CSS to stop
-        // the solid-color fill from being drawn.
-        // https://stackoverflow.com/questions/79926986
-        GtkCssProvider* cssProvider = gtk_css_provider_new();
-        gtk_css_provider_load_from_string(cssProvider, "window { background: transparent; }");
-        gtk_style_context_add_provider_for_display(
-            display, GTK_STYLE_PROVIDER(cssProvider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        g_object_unref(cssProvider);
-    }
-#endif
+    // The window background shows for a moment during a resize, before the first
+    // frame at the new size is painted. Match the renderer's clear color
+    // (0x101018, frontend/renderer.cpp) so the transient gap is seamless.
+    GtkCssProvider* cssProvider = gtk_css_provider_new();
+    gtk_css_provider_load_from_string(cssProvider, "window { background: #101018; }");
+    gtk_style_context_add_provider_for_display(
+        display, GTK_STYLE_PROVIDER(cssProvider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(cssProvider);
+
 #ifdef GDK_WINDOWING_WAYLAND
-    const bool wayland = GDK_IS_WAYLAND_DISPLAY(display);
-    if (wayland) {
+    if (GDK_IS_WAYLAND_DISPLAY(display)) {
         g_setenv("GSK_RENDERER", "cairo", TRUE);
         g_setenv("GDK_GL_DISABLE", "1", TRUE);
-        // The bgfx content is a subsurface that lags the root by up to one
-        // frame during a resize; the newly exposed area shows this window
-        // background. Match the renderer's clear color (0x101018,
-        // frontend/renderer.cpp) so the one-frame gap is invisible (no strip /
-        // flicker) — same trick as macos/window.mm.
-        GtkCssProvider* cssProvider = gtk_css_provider_new();
-        gtk_css_provider_load_from_string(cssProvider, "window { background: #101018; }");
-        gtk_style_context_add_provider_for_display(
-            display, GTK_STYLE_PROVIDER(cssProvider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        g_object_unref(cssProvider);
         s_header = gtk_header_bar_new();
         GtkWidget* titleLabel = gtk_label_new(title);
         gtk_header_bar_set_title_widget(GTK_HEADER_BAR(s_header), titleLabel);
         gtk_header_bar_set_decoration_layout(GTK_HEADER_BAR(s_header), ":close");
         gtk_window_set_titlebar(GTK_WINDOW(s_win), s_header);
-        g_signal_connect(s_header, "notify::scale-factor", G_CALLBACK(onHeaderScaleFactorChanged), nullptr);
+        g_signal_connect(s_header, "notify::scale-factor",
+                         G_CALLBACK(onHeaderScaleFactorChanged), nullptr);
     }
 #else
     (void)display;
@@ -294,70 +251,14 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
         uiPumpEvents(0.005);
     if (std::getenv("TETRIS_RESIZE_TEST")) g_timeout_add(100, resizeTestTick, nullptr);
 
+    // The renderer runs headless: no native window handle is needed.
     s_uiWindow.nwhType = UI_NWH_DEFAULT;
     s_uiWindow.nwh = nullptr;
     s_uiWindow.ndt = nullptr;
-    GdkSurface* surf = gtk_native_get_surface(GTK_NATIVE(s_win));
-    s_gdkSurface = surf;
-#ifdef GDK_WINDOWING_X11
-    if (surf && GDK_IS_X11_DISPLAY(display)) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"  // xid getter, still the only X11 API
-        s_uiWindow.nwh = (void*)(uintptr_t)gdk_x11_surface_get_xid(GDK_SURFACE(surf));
-        // bgfx's Vulkan X11 path calls vkCreateXlibSurfaceKHR(dpy=ndt); a NULL
-        // dpy crashes the driver (it calls XGetXCBConnection() without a check).
-#if GTK_CHECK_VERSION(4, 18, 0)
-        s_uiWindow.ndt = gdk_x11_display_get_xdisplay(GDK_X11_DISPLAY(display));
-#else
-        s_uiWindow.ndt = gdk_x11_display_get_default_xdisplay();
-#endif
-#pragma GCC diagnostic pop
-    }
-#endif
-#ifdef GDK_WINDOWING_WAYLAND
-    if (surf && GDK_IS_WAYLAND_DISPLAY(display)) {
-        // bgfx's EGL display must come from the same wl_display that owns the
-        // wl_surface, otherwise wl_egl_window/surface creation fails.
-        struct wl_display* wlDisplay = gdk_wayland_display_get_wl_display(display);
-        struct wl_surface* rootSurface = gdk_wayland_surface_get_wl_surface(GDK_SURFACE(surf));
-        s_wlDisplay = wlDisplay;
-        s_rootSurface = rootSurface;
-        // Hand the new size to the game thread in the LAYOUT phase (before the
-        // PAINT phase commits the root), so the content resize is requested as
-        // early as possible. Connected after GtkNative's allocator so s_area is
-        // already at the new size when this runs.
-        g_signal_connect(surf, "layout", G_CALLBACK(onContentLayout), nullptr);
-        bool globalsOk = (wlDisplay != nullptr) && bindWaylandGlobals(wlDisplay);
-        if (wlDisplay != nullptr && rootSurface != nullptr && s_header != nullptr &&
-            globalsOk) {
-            s_contentSurface = wl_compositor_create_surface(s_compositor);
-            s_contentSub = wl_subcompositor_get_subsurface(s_subcompositor,
-                                                           s_contentSurface,
-                                                           rootSurface);
-            s_headerHeightPx = headerHeightPx(s_header);
-            wl_surface_set_buffer_scale(s_contentSurface, (int32_t)s_scale);
-            int gapY = (int)headerHeightLogical(s_header);
-            if (std::getenv("TETRIS_GAP_TEST")) gapY += 100;  // TEMP-TEST: 100px band
-            wl_subsurface_set_position(s_contentSub, 0, gapY);
-            wl_subsurface_place_above(s_contentSub, rootSurface);
-            fprintf(stderr, "[window] content surface created scale=%d headerLogical=%d headerPx=%d\n",
-                    s_scale, headerHeightLogical(s_header), s_headerHeightPx);
-            wl_surface_commit(rootSurface);
-            wl_display_flush(wlDisplay);
-            s_uiWindow.nwh = s_contentSurface;
-        } else {
-            s_uiWindow.nwh = rootSurface;
-        }
-        s_uiWindow.ndt = wlDisplay;
-        s_uiWindow.nwhType = UI_NWH_WAYLAND;
-    }
-#endif
+    s_uiWindow.offscreen = 1;
     return &s_uiWindow;
 }
 
-// Pump GTK events (and let the allocation update) WITHOUT committing the root
-// surface. The caller commits the frame via uiCommitFrame() after pushing the
-// new size to the renderer (see main.cpp).
 void uiPumpEvents(double timeoutSec) {
     GMainContext* ctx = g_main_context_default();
     gint64 deadline = g_get_monotonic_time() + (gint64)(timeoutSec * 1e6);
@@ -369,22 +270,27 @@ void uiPumpEvents(double timeoutSec) {
     } while (g_get_monotonic_time() < deadline);
 }
 
-#ifdef GDK_WINDOWING_WAYLAND
-// Commit the root surface (and re-align the content subsurface). Call once per
-// frame. The content subsurface is committed independently by the renderer's
-// thread, so this presents the new window size immediately; the content
-// catches up within a frame (the gap shows the matching window background).
-void uiCommitFrame(void) {
-    if (s_rootSurface == nullptr || s_wlDisplay == nullptr) return;
-    // Keep the subsurface aligned with the content area (the CSD shadow offset
-    // can only be known once the compositor has mapped the window).
-    updateContentSubPosition();
-    wl_surface_commit(s_rootSurface);
-    wl_display_flush(s_wlDisplay);
-}
-#else
+// Nothing to commit: GTK's own frame clock presents the drawing area.
 void uiCommitFrame(void) {}
-#endif
+
+void uiPushFrame(uint32_t w, uint32_t h, const uint8_t* bgra) {
+    std::lock_guard<std::mutex> lk(s_frame.mu);
+    const size_t n = (size_t)w * (size_t)h * 4u;
+    if (s_frame.buf.size() != n) s_frame.buf.resize(n);
+    if (bgra != nullptr && n != 0) memcpy(s_frame.buf.data(), bgra, n);
+    s_frame.w = w;
+    s_frame.h = h;
+    s_frame.seq++;
+}
+
+void uiPresentFrame(void) {
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> lk(s_frame.mu);
+        fresh = (s_frame.seq != s_frame.presented);
+    }
+    if (fresh && s_area != nullptr) gtk_widget_queue_draw(s_area);
+}
 
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData) {
     s_frameSyncCb = cb;
@@ -418,26 +324,14 @@ void uiWindowSize(uint32_t* w, uint32_t* h) {
 }
 
 void uiShutdown(void) {
-#ifdef GDK_WINDOWING_WAYLAND
-    // Destroy the bgfx-owned content surface only after bgfx has shut down.
-    if (s_contentSub != nullptr) {
-        wl_subsurface_destroy(s_contentSub);
-        s_contentSub = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(s_frame.mu);
+        if (s_frame.surf != nullptr) {
+            cairo_surface_destroy(s_frame.surf);
+            s_frame.surf = nullptr;
+        }
+        s_frame.buf.clear();
     }
-    if (s_contentSurface != nullptr) {
-        wl_surface_destroy(s_contentSurface);
-        s_contentSurface = nullptr;
-    }
-    if (s_subcompositor != nullptr) {
-        wl_subcompositor_destroy(s_subcompositor);
-        s_subcompositor = nullptr;
-    }
-    if (s_compositor != nullptr) {
-        wl_compositor_destroy(s_compositor);
-        s_compositor = nullptr;
-    }
-    s_headerHeightPx = 0;
-#endif
     if (s_win != nullptr) {
         // The widget does not own the controller (it is not ref'd on add);
         // gtk_widget_remove_controller() performs the final unref, so we must

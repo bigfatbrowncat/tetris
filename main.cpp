@@ -47,17 +47,17 @@ static TetrisBackend::Key toBackendKey(int k) {
     }
 }
 
-// Wayland resizes the content asynchronously (see main()): the content is a
-// subsurface that the compositor keeps showing at its last committed size, and
-// the window background matches the renderer's clear color, so the root can
-// commit the new size immediately (no resize lag) while the content catches up
-// within a frame with no visible strip. Other backends block until the frame
-// is presented, keeping the canvas in the same frame as the window resize.
-static bool s_asyncResize = false;
+// Offscreen (headless renderer, GTK): the UI layer presents the frames the
+// renderer publishes. Resizes are non-blocking — the drawing area immediately
+// covers the new size with the clear color + the last frame (pinned top-left),
+// so there is no visible strip while the renderer catches up. Windowed
+// backends (macOS) block until the frame is presented, keeping the canvas in
+// the same frame as the window resize.
+static bool s_offscreen = false;
 
 static void onFrameSync(uint32_t w, uint32_t h, void* user) {
     TetrisFrontend* fe = static_cast<TetrisFrontend*>(user);
-    if (s_asyncResize) fe->setWindowSize(w, h);
+    if (s_offscreen) fe->setWindowSize(w, h);
     else fe->repaintSynchronous(w, h);
 }
 
@@ -69,7 +69,7 @@ int main() {
         return 1;
     }
 
-    s_asyncResize = (window->nwhType == UI_NWH_WAYLAND);
+    s_offscreen = (window->offscreen != 0);
 
     TetrisFrontend frontend;
     uiSetFrameSyncCallback(&onFrameSync, &frontend);
@@ -80,17 +80,18 @@ int main() {
     // call bgfx::renderFrame() here (see the notes above).
     //
     // Per-frame ordering:
-    //   1. uiPumpEvents  -> process events, update the allocation. On Wayland
-    //                        the "layout" hook hands the new size to the game
-    //                        thread (non-blocking).
-    //   2. set/repaint   -> push the new size to the game thread.
-    //                        Wayland: setWindowSize() (async — the root commits
-    //                        the new size immediately; the subsurface catches up
-    //                        within a frame and the gap shows the matching window
-    //                        background). X11/macOS: repaintSynchronous() (blocks
-    //                        until the frame is presented, so the canvas and the
-    //                        window land in the same frame).
-    //   3. uiCommitFrame -> commit the root surface (Wayland).
+    //   1. uiPumpEvents  -> process events, update the allocation. Offscreen
+    //                        (GTK), the drawing-area paint also hands the new
+    //                        size to the game thread (non-blocking).
+    //   2. size handoff  -> offscreen: setWindowSize() (non-blocking — the
+    //                        drawing area covers the new size immediately with
+    //                        the clear color + last frame, no visible strip)
+    //                        + uiPresentFrame() (repaint with the latest
+    //                        published frame). Windowed (macOS):
+    //                        repaintSynchronous() (blocks until the frame is
+    //                        presented, so the canvas and the window land in the
+    //                        same frame).
+    //   3. uiCommitFrame -> windowed backends only.
     while (!frontend.loopDone()) {
         uiPumpEvents(0.016);
         int k;
@@ -98,9 +99,13 @@ int main() {
             frontend.pushKey(toBackendKey(k));
         uint32_t pw, ph;
         uiWindowSize(&pw, &ph);
-        if (s_asyncResize) frontend.setWindowSize(pw, ph);
-        else frontend.repaintSynchronous(pw, ph);
-        uiCommitFrame();
+        if (s_offscreen) {
+            frontend.setWindowSize(pw, ph);
+            uiPresentFrame();
+        } else {
+            frontend.repaintSynchronous(pw, ph);
+            uiCommitFrame();
+        }
         if (uiShouldQuit()) frontend.requestStop();
     }
 

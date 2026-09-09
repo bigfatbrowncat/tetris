@@ -113,6 +113,15 @@ void TetrisFrontend::run(const UiWindow* win) {
         const uint32_t rh = m_pxH.load();
         m_renderer->render(m_backend.state(), rw, rh);
         m_renderer->endFrame();
+        // Offscreen: publish the just-read-back frame to the UI layer. This must
+        // happen before m_lastRenderedW/H is updated below so the frame is in
+        // the store whenever a caller observes the size change.
+        {
+            uint32_t fw = 0, fh = 0;
+            if (const uint8_t* px = m_renderer->framePixels(&fw, &fh)) {
+                uiPushFrame(fw, fh, px);
+            }
+        }
         // On a synchronous resize, wait until this frame is actually presented
         // (not merely submitted) before waking repaintSynchronous(): the UI
         // thread commits the new window size immediately after, so the content

@@ -42,10 +42,19 @@ public:
     // Block until the frame submitted by the preceding endFrame() has been
     // presented to the native surface. Issues the extra bgfx::frame() calls
     // that bgfx's multithreaded pipeline needs before that present is guaranteed.
+    // No-op when running offscreen (there is no native surface to present to).
     void syncPresent();
 
     // Ask bgfx to write a screenshot (delivered via the CallbackI::screenShot).
     void requestScreenShot(const char* path);
+
+    // Offscreen mode only: after endFrame() has returned, the just-rendered
+    // frame has been read back. Return its raw BGRA8 pixels (w*h*4 bytes, top
+    // row first) and its size. Returns nullptr when not running offscreen.
+    // The pointer stays valid until the next render().
+    const uint8_t* framePixels(uint32_t* w, uint32_t* h) const;
+
+    bool offscreen() const;
 
 private:
     class Impl;

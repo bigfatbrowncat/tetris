@@ -262,7 +262,34 @@ public:
     bool ok = false;
     const bgfx::Caps* caps = nullptr;
 
+    // Offscreen (headless) mode: the scene renders to a GPU texture that is
+    // blitted to a CPU-readable texture and read back into frameBuf each frame.
+    bool offscreen = false;
+    bgfx::TextureHandle offRT = BGFX_INVALID_HANDLE;   // scene render target
+    bgfx::FrameBufferHandle offFB = BGFX_INVALID_HANDLE; // FBO wrapping offRT
+    bgfx::TextureHandle readback = BGFX_INVALID_HANDLE; // blit dst / read-back
+    std::vector<uint8_t> frameBuf;                      // BGRA8, top row first
+    uint32_t frameW = 0, frameH = 0;
+
+    void resizeOffscreen(uint32_t pw, uint32_t ph) {
+        // Destroy the old pair; bgfx defers destruction until in-flight frames
+        // that still reference them have completed.
+        if (bgfx::isValid(offFB)) { bgfx::destroy(offFB); offFB = BGFX_INVALID_HANDLE; }
+        if (bgfx::isValid(offRT)) { bgfx::destroy(offRT); offRT = BGFX_INVALID_HANDLE; }
+        if (bgfx::isValid(readback)) { bgfx::destroy(readback); readback = BGFX_INVALID_HANDLE; }
+        offRT = bgfx::createTexture2D(pw, ph, false, 1,
+                                     bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_RT);
+        offFB = bgfx::createFrameBuffer(1, &offRT);
+        readback = bgfx::createTexture2D(pw, ph, false, 1,
+                                         bgfx::TextureFormat::BGRA8,
+                                         BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK);
+        frameW = pw;
+        frameH = ph;
+        frameBuf.resize((size_t)pw * (size_t)ph * 4);
+    }
+
     bool init(const UiWindow* win) {
+        offscreen = (win->offscreen != 0);
 #if BX_PLATFORM_OSX
         m_resetFlags = BGFX_RESET_VSYNC;
 #else
@@ -278,15 +305,27 @@ public:
         init.type = bgfx::RendererType::Vulkan;  // SPIR-V headers (shaders/vk/)
 #endif
         init.fallback = true;
-        init.platformData.nwh = win->nwh;
-        init.platformData.ndt = win->ndt;
-        init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
-        init.resolution.width = 640;
-        init.resolution.height = 640;
-        init.resolution.reset = m_resetFlags;
         init.callback = &g_shotImpl;
+        if (offscreen) {
+            // Headless: no native window. bgfx::Context::init() treats a fully
+            // NULL platformData as a headless device, and in that case the
+            // backbuffer resolution must be 0x0 (there is no backbuffer). We never
+            // call bgfx::reset() in this mode.
+            init.platformData.nwh = nullptr;
+            init.platformData.ndt = nullptr;
+            init.platformData.type = bgfx::NativeWindowHandleType::Default;
+            init.resolution.width = 0;
+            init.resolution.height = 0;
+            init.resolution.reset = 0;
+        } else {
+            init.platformData.nwh = win->nwh;
+            init.platformData.ndt = win->ndt;
+            init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
+            init.resolution.width = 640;
+            init.resolution.height = 640;
+            init.resolution.reset = m_resetFlags;
 #if !BX_PLATFORM_OSX
-        if (win->nwhType == UI_NWH_WAYLAND) {
+            if (win->nwhType == UI_NWH_WAYLAND) {
             // The Vulkan spec (VK_KHR_wayland_surface, issue #2 / revision 6) REQUIRES
             // Wayland implementations to expose VK_PRESENT_MODE_MAILBOX_KHR — Wayland
             // is an inherently mailbox window system. So there is no FIFO fallback:
@@ -311,6 +350,7 @@ public:
             }
         }
 #endif  // !BX_PLATFORM_OSX
+        }  // windowed (non-offscreen)
         if (!bgfx::init(init)) {
             fprintf(stderr, "[tetris] bgfx init failed\n");
             return false;
@@ -344,6 +384,11 @@ public:
 
     void shutdown() {
         if (!ok) return;
+        if (offscreen) {
+            if (bgfx::isValid(offFB)) bgfx::destroy(offFB);
+            if (bgfx::isValid(offRT)) bgfx::destroy(offRT);
+            if (bgfx::isValid(readback)) bgfx::destroy(readback);
+        }
         if (bgfx::isValid(vbuf)) bgfx::destroy(vbuf);
         if (bgfx::isValid(atlas)) bgfx::destroy(atlas);
         if (bgfx::isValid(uTex)) bgfx::destroy(uTex);
@@ -353,7 +398,17 @@ public:
     }
 
     void endFrame() {
-        if (ok) bgfx::frame();
+        if (!ok) return;
+        if (offscreen) {
+            // First frame() hands this frame to the render thread (which runs
+            // the blit + read-back and blocks the GPU synchronously); the second
+            // frame() waits (renderSemWait) until that frame is fully processed,
+            // so frameBuf is complete on return.
+            bgfx::frame();
+            bgfx::frame();
+        } else {
+            bgfx::frame();
+        }
     }
 
     // Block until the frame most recently submitted via endFrame() has
@@ -361,15 +416,30 @@ public:
     // flushed on Wayland). In bgfx's multithreaded mode frame N is presented
     // by the internal render thread while processing frame N+1, so the
     // present of frame N is only guaranteed once two further bgfx::frame()
-    // calls have returned.
+    // calls have returned. No-op offscreen (no native surface to present to).
     void syncPresent() {
-        if (!ok) return;
+        if (!ok || offscreen) return;
         bgfx::frame();
         bgfx::frame();
     }
 
     void requestScreenShot(const char* path) {
-        if (ok) bgfx::requestScreenShot(BGFX_INVALID_HANDLE, path);
+        if (!ok) return;
+        if (offscreen) {
+            // frameBuf is BGRA8, top row first.
+            if (frameW != 0 && frameH != 0)
+                writeBmp(path, frameW, frameH, frameW * 4, frameBuf.data(),
+                         /*yflip=*/false, /*isBgra=*/true);
+        } else {
+            bgfx::requestScreenShot(BGFX_INVALID_HANDLE, path);
+        }
+    }
+
+    const uint8_t* framePixels(uint32_t* w, uint32_t* h) const {
+        if (!offscreen) return nullptr;
+        if (w) *w = frameW;
+        if (h) *h = frameH;
+        return frameBuf.data();
     }
 
     // y0 = bottom, y1 = top (world y grows up). v grows down in the texture.
@@ -495,7 +565,9 @@ public:
 
     void render(const TetrisBackend::Snapshot& s, uint32_t pw, uint32_t ph) {
         if (!ok || pw == 0 || ph == 0) return;
-        if (pw != lastW || ph != lastH) {
+        if (offscreen) {
+            if (pw != frameW || ph != frameH) resizeOffscreen(pw, ph);
+        } else if (pw != lastW || ph != lastH) {
             bgfx::reset(pw, ph, m_resetFlags);
             lastW = pw; lastH = ph;
         }
@@ -511,12 +583,30 @@ public:
         computeOrtho(proj, pw, ph);
         bgfx::setViewTransform(0, view, proj);
         bgfx::setViewRect(0, 0, 0, (uint16_t)pw, (uint16_t)ph);
-        bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x101018ff, 1.0f, 0);
+        if (offscreen) {
+            // Render the scene into the GPU render target. No depth attachment,
+            // so clear color only (the scene is 2D and never uses depth).
+            bgfx::setViewFrameBuffer(0, offFB);
+            bgfx::setViewClear(0, BGFX_CLEAR_COLOR, 0x101018ff, 1.0f, 0);
+        } else {
+            bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x101018ff, 1.0f, 0);
+        }
 
         bgfx::setTexture(0, uTex, atlas);
         bgfx::setVertexBuffer(0, vbuf);
-        bgfx::setState(BGFX_STATE_WRITE_RGB);
+        // Blending composites the text glyphs (straight alpha from the atlas)
+        // over the scene; opaque geometry (a=1) is unaffected.
+        bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_BLEND_ALPHA);
         bgfx::submit(0, program);
+
+        if (offscreen) {
+            // Copy the scene to the CPU-readable texture and read it back. The
+            // read-back runs on bgfx's render thread with a synchronous GPU wait;
+            // endFrame() issues the extra bgfx::frame() that blocks until it is
+            // done, so frameBuf is complete when the caller proceeds.
+            bgfx::blit(1, { .handle = readback }, { .handle = offRT });
+            bgfx::read({ .handle = readback }, frameBuf.data());
+        }
     }
 };
 
@@ -528,5 +618,7 @@ void Renderer::render(const TetrisBackend::Snapshot& s, uint32_t w, uint32_t h) 
 void Renderer::endFrame() { m_impl->endFrame(); }
 void Renderer::syncPresent() { m_impl->syncPresent(); }
 void Renderer::requestScreenShot(const char* path) { m_impl->requestScreenShot(path); }
+const uint8_t* Renderer::framePixels(uint32_t* w, uint32_t* h) const { return m_impl->framePixels(w, h); }
+bool Renderer::offscreen() const { return m_impl->offscreen; }
 
 }  // namespace tetris
