@@ -100,10 +100,16 @@ target_include_directories(tetrisfront PUBLIC
     ${CMAKE_SOURCE_DIR}/frontend # font.h
     ${BGFX_ROOT}/include
     ${BX_ROOT}/include)
-target_link_libraries(tetrisfront PUBLIC
-    tetrisback
-    bgfxRelease bimgRelease bxRelease    # resolved via the link dir below
-    vulkan)                              # VK_KHR_wayland_surface mailbox detection
+if(APPLE)
+    target_link_libraries(tetrisfront PUBLIC
+        tetrisback
+        bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
+else()
+    target_link_libraries(tetrisfront PUBLIC
+        tetrisback
+        bgfxRelease bimgRelease bxRelease    # resolved via the link dir below
+        vulkan)                              # VK_KHR_wayland_surface mailbox detection
+endif()
 target_link_directories(tetrisfront PUBLIC ${TP_BIN})
 add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)
 
