@@ -11,8 +11,12 @@
 #
 #  Build:
 #    cmake -S . -B build
-#    cmake --build build            # ./tetris
+#    cmake --build build            # ./build/tetris
 #    cmake --build build --target shaders   # regenerate embedded shader headers
+#
+#  All generated files (the executable, the embedded shader headers) are
+#  written only inside the build directory; the build never touches the
+#  source tree.
 #
 #  Clean:
 #    cmake --build build --target clean        # app artifacts only
@@ -39,8 +43,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Keep the executable next to the sources, like the old Makefile did.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR})
+# The executable lands in the build dir (CMake default).
 
 # Third-party bgfx build (targets: tp_bx, tp_bimg, tp_bgfx, tp_shaderc, third-party)
 add_subdirectory(third-party)
@@ -48,6 +51,12 @@ add_subdirectory(third-party)
 # ----------------------------------------------------------------------------
 #  UI module selection (platform detected at configure time)
 # ----------------------------------------------------------------------------
+# The embedded shader headers are generated into the build dir
+# (${GEN_SHADERS}/shaders/); that dir is first on the include path so the
+# shared `#include "shaders/vs_quad.h"` in the frontend always resolves to
+# the generated files.
+set(GEN_SHADERS "${CMAKE_BINARY_DIR}/gen-shaders")
+
 if(APPLE)
     set(UI_SOURCES macos/window.mm)
     set(UI_LINK
@@ -58,27 +67,16 @@ if(APPLE)
         "-framework CoreVideo"
         "-framework CoreMedia"
         "-framework VideoToolbox")
-    # Committed Metal headers in shaders/ are used directly.
-    set(PLATFORM_SHADERS_INC "")
 elseif(UNIX)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
     pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
     set(UI_SOURCES gtk/window.cpp)
     set(UI_LINK PkgConfig::GTK4 PkgConfig::WAYLAND_CLIENT)
-    # Committed SPIR-V headers live in shaders/vk/; stage them in the build
-    # dir so the shared `#include "shaders/vs_quad.h"` in the frontend finds
-    # them before the macOS ones in shaders/.
-    set(GEN_SHADERS "${CMAKE_BINARY_DIR}/gen-shaders")
-    set(PLATFORM_SHADERS_INC ${GEN_SHADERS})
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h")
-        message(WARNING
-            "shaders/vk/*.h not found — run 'cmake --build build --target shaders' "
-            "(after tp_shaderc) before building the app.")
-    endif()
 else()
     message(FATAL_ERROR "Unsupported platform (need macOS or Linux)")
 endif()
+set(PLATFORM_SHADERS_INC ${GEN_SHADERS})
 
 # ----------------------------------------------------------------------------
 #  tetrisback — game logic (no UI, no OS)
@@ -95,8 +93,8 @@ add_library(tetrisfront STATIC
     frontend/renderer.cpp
     frontend/tetris_frontend.cpp)
 target_include_directories(tetrisfront PUBLIC
-    ${PLATFORM_SHADERS_INC}      # staged platform shader headers (Linux)
-    ${CMAKE_SOURCE_DIR}          # ui/window.h, shaders/vs_quad.h etc.
+    ${PLATFORM_SHADERS_INC}      # generated shader headers (build dir)
+    ${CMAKE_SOURCE_DIR}          # ui/window.h etc.
     ${CMAKE_SOURCE_DIR}/frontend # font.h
     ${BGFX_ROOT}/include
     ${BX_ROOT}/include)
@@ -114,46 +112,29 @@ target_link_directories(tetrisfront PUBLIC ${TP_BIN})
 add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)
 
 # ----------------------------------------------------------------------------
-#  shaders — regenerate the committed C header arrays from the .sc sources.
-#  Explicit target (like the old phony `make shaders`); the app only needs the
-#  headers to exist, which they do (they are committed).
+#  shaders — generate the C header arrays from the .sc sources, into the
+#  build dir only (${GEN_SHADERS}/shaders/). tetrisfront depends on
+#  gen_shaders, so a fresh build generates the headers before compiling.
 # ----------------------------------------------------------------------------
-set(SHADER_CMDS
+set(GEN_SHADER_HDRS
+    ${GEN_SHADERS}/shaders/vs_quad.h
+    ${GEN_SHADERS}/shaders/fs_quad.h)
+
+add_custom_command(
+    OUTPUT ${GEN_SHADER_HDRS}
     COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build_shaders.py
-    ENVIRONMENT "BIN=${TP_BIN}" "BGFX=${BGFX_ROOT}")
-
-if(NOT APPLE)
-    # The app build compiles against staged copies of the committed SPIR-V
-    # headers (so the shared `#include "shaders/vs_quad.h"` resolves to them).
-    set(GEN_SHADER_HDRS
-        ${GEN_SHADERS}/shaders/vs_quad.h
-        ${GEN_SHADERS}/shaders/fs_quad.h)
-    add_custom_command(
-        OUTPUT ${GEN_SHADER_HDRS}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_SHADERS}/shaders
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h ${GEN_SHADERS}/shaders/
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/vk/fs_quad.h ${GEN_SHADERS}/shaders/
-        DEPENDS ${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h
-                ${CMAKE_SOURCE_DIR}/shaders/vk/fs_quad.h
-        COMMENT "[shaders] staging SPIR-V headers"
-        VERBATIM)
-    add_custom_target(gen_shaders DEPENDS ${GEN_SHADER_HDRS})
-    add_dependencies(tetrisfront gen_shaders)
-    # `shaders` regenerates the headers, then refreshes the staged copies.
-    list(APPEND SHADER_CMDS
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_SHADERS}/shaders
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/vk/vs_quad.h ${GEN_SHADERS}/shaders/
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${CMAKE_SOURCE_DIR}/shaders/vk/fs_quad.h ${GEN_SHADERS}/shaders/)
-endif()
-
-add_custom_target(shaders ${SHADER_CMDS}
+            ${GEN_SHADERS}/shaders ${TP_BIN}/shadercRelease ${BGFX_ROOT}
+    DEPENDS ${CMAKE_SOURCE_DIR}/shaders/vs_quad.sc
+            ${CMAKE_SOURCE_DIR}/shaders/fs_quad.sc
+            tp_shaderc
     COMMENT "[shaders] building vs_quad/fs_quad"
     VERBATIM)
-add_dependencies(shaders tp_shaderc)
+
+add_custom_target(gen_shaders DEPENDS ${GEN_SHADER_HDRS})
+add_dependencies(tetrisfront gen_shaders)
+
+# Explicit target (like the old phony `make shaders`); no-op if current.
+add_custom_target(shaders DEPENDS gen_shaders)
 
 # ----------------------------------------------------------------------------
 #  tetris — executable (main.cpp + the platform UI module)

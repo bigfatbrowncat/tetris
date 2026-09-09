@@ -302,7 +302,7 @@ public:
 #if BX_PLATFORM_OSX
         init.type = bgfx::RendererType::Count;   // auto-select -> Metal
 #else
-        init.type = bgfx::RendererType::Vulkan;  // SPIR-V headers (shaders/vk/)
+        init.type = bgfx::RendererType::Vulkan;  // SPIR-V headers (build dir)
 #endif
         init.fallback = true;
         init.callback = &g_shotImpl;
