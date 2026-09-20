@@ -1,4 +1,4 @@
-// Renderer implementation (bgfx; Metal on macOS, Vulkan on Linux).
+// Renderer implementation (bgfx; Metal on macOS, OpenGL/EGL on Linux).
 #include "renderer.h"
 
 #include "font.h"
@@ -9,8 +9,11 @@
 #include <bx/platform.h>
 
 #if !BX_PLATFORM_OSX
-#include <vulkan/vulkan.h>
-#include <vulkan/vulkan_wayland.h>
+// Epoxy first: it defines __khrplatform_h_ itself, which suppresses the
+// duplicate khronos enum in the real KHR/khrplatform.h pulled in by EGL.
+#include <epoxy/gl.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #endif
 
 #include <cstdint>
@@ -163,90 +166,6 @@ ShotCallback g_shotImpl;
 
 struct Vert { float x, y, u, v, r, g, b; };
 
-#if !BX_PLATFORM_OSX
-// Probe the Vulkan WSI for the given Wayland surface. Returns whether any
-// physical device can present in VK_PRESENT_MODE_MAILBOX_KHR, plus the GPU
-// driver name (for the no-mailbox diagnostic). We open a throwaway VkInstance
-// with the surface + Wayland-surface extensions, build a VkSurfaceKHR over the
-// content wl_surface, query each physical device, then tear everything down.
-// Run BEFORE bgfx::init() so the result can select (or reject) the present mode.
-struct WsiProbe {
-    bool mailbox = false;
-    std::string driverName;
-};
-WsiProbe probeWsi(void* wlSurface, void* wlDisplay) {
-    WsiProbe result;
-    if (wlSurface == nullptr || wlDisplay == nullptr) return result;
-
-    uint32_t extCount = 0;
-    if (vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr) != VK_SUCCESS) return result;
-    std::vector<VkExtensionProperties> extProps(extCount);
-    if (vkEnumerateInstanceExtensionProperties(nullptr, &extCount, extProps.data()) != VK_SUCCESS) return result;
-
-    std::vector<const char*> reqExts;
-    bool hasSurface = false, hasWayland = false;
-    for (const auto& p : extProps) {
-        if (strcmp(p.extensionName, VK_KHR_SURFACE_EXTENSION_NAME) == 0) {
-            hasSurface = true;
-            reqExts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-        } else if (strcmp(p.extensionName, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME) == 0) {
-            hasWayland = true;
-            reqExts.push_back(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
-        }
-    }
-    if (!hasSurface || !hasWayland) return result;
-
-    VkApplicationInfo appInfo{};
-    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "tetris";
-    appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.pEngineName = "tetris";
-    appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.apiVersion = VK_API_VERSION_1_0;
-
-    VkInstanceCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    ci.pApplicationInfo = &appInfo;
-    ci.enabledExtensionCount = (uint32_t)reqExts.size();
-    ci.ppEnabledExtensionNames = reqExts.data();
-
-    VkInstance instance = VK_NULL_HANDLE;
-    if (vkCreateInstance(&ci, nullptr, &instance) != VK_SUCCESS) return result;
-
-    std::vector<VkPhysicalDevice> devices;
-    uint32_t devCount = 0;
-    if (vkEnumeratePhysicalDevices(instance, &devCount, nullptr) == VK_SUCCESS && devCount > 0) {
-        devices.resize(devCount);
-        if (vkEnumeratePhysicalDevices(instance, &devCount, devices.data()) == VK_SUCCESS) {
-            VkPhysicalDeviceProperties props{};
-            vkGetPhysicalDeviceProperties(devices[0], &props);
-            result.driverName = props.deviceName;
-        }
-    }
-
-    VkWaylandSurfaceCreateInfoKHR si{};
-    si.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
-    si.display = (struct wl_display*)wlDisplay;
-    si.surface = (struct wl_surface*)wlSurface;
-
-    VkSurfaceKHR surface = VK_NULL_HANDLE;
-    if (vkCreateWaylandSurfaceKHR(instance, &si, nullptr, &surface) == VK_SUCCESS) {
-        for (uint32_t i = 0; i < devices.size() && !result.mailbox; ++i) {
-            uint32_t modeCount = 0;
-            if (vkGetPhysicalDeviceSurfacePresentModesKHR(devices[i], surface, &modeCount, nullptr) != VK_SUCCESS) continue;
-            std::vector<VkPresentModeKHR> modes(modeCount);
-            if (vkGetPhysicalDeviceSurfacePresentModesKHR(devices[i], surface, &modeCount, modes.data()) != VK_SUCCESS) continue;
-            for (auto m : modes) {
-                if (m == VK_PRESENT_MODE_MAILBOX_KHR) { result.mailbox = true; break; }
-            }
-        }
-        vkDestroySurfaceKHR(instance, surface, nullptr);
-    }
-    vkDestroyInstance(instance, nullptr);
-    return result;
-}
-#endif  // !BX_PLATFORM_OSX
-
 }  // namespace
 
 class Renderer::Impl {
@@ -262,95 +181,80 @@ public:
     bool ok = false;
     const bgfx::Caps* caps = nullptr;
 
-    // Offscreen (headless) mode: the scene renders to a GPU texture that is
-    // blitted to a CPU-readable texture and read back into frameBuf each frame.
-    bool offscreen = false;
-    bgfx::TextureHandle offRT = BGFX_INVALID_HANDLE;   // scene render target
-    bgfx::FrameBufferHandle offFB = BGFX_INVALID_HANDLE; // FBO wrapping offRT
-    bgfx::TextureHandle readback = BGFX_INVALID_HANDLE; // blit dst / read-back
-    std::vector<uint8_t> frameBuf;                      // BGRA8, top row first
-    uint32_t frameW = 0, frameH = 0;
-
-    void resizeOffscreen(uint32_t pw, uint32_t ph) {
-        // Destroy the old pair; bgfx defers destruction until in-flight frames
-        // that still reference them have completed.
-        if (bgfx::isValid(offFB)) { bgfx::destroy(offFB); offFB = BGFX_INVALID_HANDLE; }
-        if (bgfx::isValid(offRT)) { bgfx::destroy(offRT); offRT = BGFX_INVALID_HANDLE; }
-        if (bgfx::isValid(readback)) { bgfx::destroy(readback); readback = BGFX_INVALID_HANDLE; }
-        offRT = bgfx::createTexture2D(pw, ph, false, 1,
-                                     bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_RT);
-        offFB = bgfx::createFrameBuffer(1, &offRT);
-        readback = bgfx::createTexture2D(pw, ph, false, 1,
-                                         bgfx::TextureFormat::BGRA8,
-                                         BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK);
-        frameW = pw;
-        frameH = ph;
-        frameBuf.resize((size_t)pw * (size_t)ph * 4);
-    }
+#if !BX_PLATFORM_OSX
+    // Linux GL area path: single-threaded bgfx on the UI thread, rendering the
+    // scene into the UI layer's shared scene texture (sceneTex) through the
+    // UI layer's pbuffer context (bgfx adopts it via Init.platformData.context).
+    bool m_glarea = false;
+    EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
+    EGLContext m_eglContext = EGL_NO_CONTEXT;
+    EGLSurface m_eglPbuffer = EGL_NO_SURFACE;
+    EGLSurface m_eglAreaSurf = EGL_NO_SURFACE;
+    GLuint m_sceneTex = 0;
+    bgfx::TextureHandle sceneRT = BGFX_INVALID_HANDLE;   // bgfx handle over sceneTex
+    bgfx::FrameBufferHandle sceneFB = BGFX_INVALID_HANDLE;
+#endif
 
     bool init(const UiWindow* win) {
-        offscreen = (win->offscreen != 0);
-#if BX_PLATFORM_OSX
-        m_resetFlags = BGFX_RESET_VSYNC;
-#else
-        // No vsync flag -> bgfx picks VK_PRESENT_MODE_IMMEDIATE_KHR: a frame is
-        // presented as soon as it is rendered, so a resize frame lands without
-        // waiting for the next vblank (no white strip / flicker on X11 resize).
-        m_resetFlags = 0;
-#endif
         bgfx::Init init;
+        init.callback = &g_shotImpl;
 #if BX_PLATFORM_OSX
         init.type = bgfx::RendererType::Count;   // auto-select -> Metal
-#else
-        init.type = bgfx::RendererType::Vulkan;  // SPIR-V headers (build dir)
-#endif
         init.fallback = true;
-        init.callback = &g_shotImpl;
-        if (offscreen) {
-            // Headless: no native window. bgfx::Context::init() treats a fully
-            // NULL platformData as a headless device, and in that case the
-            // backbuffer resolution must be 0x0 (there is no backbuffer). We never
-            // call bgfx::reset() in this mode.
-            init.platformData.nwh = nullptr;
-            init.platformData.ndt = nullptr;
-            init.platformData.type = bgfx::NativeWindowHandleType::Default;
-            init.resolution.width = 0;
-            init.resolution.height = 0;
-            init.resolution.reset = 0;
-        } else {
-            init.platformData.nwh = win->nwh;
-            init.platformData.ndt = win->ndt;
-            init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
-            init.resolution.width = 640;
-            init.resolution.height = 640;
-            init.resolution.reset = m_resetFlags;
-#if !BX_PLATFORM_OSX
-            if (win->nwhType == UI_NWH_WAYLAND) {
-            // The Vulkan spec (VK_KHR_wayland_surface, issue #2 / revision 6) REQUIRES
-            // Wayland implementations to expose VK_PRESENT_MODE_MAILBOX_KHR — Wayland
-            // is an inherently mailbox window system. So there is no FIFO fallback:
-            // probe for mailbox, force it, and fail loudly (with diagnostics) if a
-            // spec-compliant driver somehow doesn't expose it.
-            const WsiProbe probe = probeWsi(win->nwh, win->ndt);
-            if (probe.mailbox) {
-                fprintf(stderr, "[tetris] WSI present mode: mailbox (driver: %s)\n",
-                        probe.driverName.c_str());
-                setenv("MESA_VK_WSI_PRESENT_MODE", "mailbox", 0);
-            } else {
-                const char* server = (win->nwhType == UI_NWH_WAYLAND) ? "Wayland" : "X11";
-                fprintf(stderr,
-                    "[tetris] FATAL: VK_PRESENT_MODE_MAILBOX_KHR is not available on this system.\n"
-                    "        graphics server : %s\n"
-                    "        dri version     : dri3 (Vulkan)\n"
-                    "        driver          : %s\n"
-                    "        VK_PRESENT_MODE_MAILBOX_KHR is required on %s "
-                    "(mandated by VK_KHR_wayland_surface) but the driver does not expose it.\n",
-                    server, probe.driverName.c_str(), server);
-                return false;
-            }
+        init.platformData.nwh = win->nwh;
+        init.platformData.ndt = win->ndt;
+        init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
+        init.resolution.width = 640;
+        init.resolution.height = 640;
+        init.resolution.reset = m_resetFlags;
+#else
+        m_glarea = (win->offscreen != 0);
+        if (!m_glarea) {
+            fprintf(stderr, "[tetris] Linux windowed (non-GL-area) mode is not supported\n");
+            return false;
         }
-#endif  // !BX_PLATFORM_OSX
-        }  // windowed (non-offscreen)
+        // eglAreaSurface may legitimately be NULL: on Wayland the GL area's
+        // context is surfaceless (GDK swaps the window surface itself in
+        // end_frame), and the UI layer re-binds it surfaceless before the
+        // blit.
+        if (win->eglDisplay == nullptr || win->eglContext == nullptr ||
+            win->sceneTex == 0) {
+            fprintf(stderr, "[tetris] GL area mode: the UI layer did not provide the EGL resources\n");
+            return false;
+        }
+        m_eglDisplay  = (EGLDisplay)win->eglDisplay;
+        m_eglContext  = (EGLContext)win->eglContext;
+        // NULL = surfaceless (EGL_NO_SURFACE): legal for a
+        // EGL_KHR_surfaceless_context, and what bgfx adopts as its (unused)
+        // surface.
+        m_eglPbuffer  = (EGLSurface)win->eglPbuffer;
+        m_eglAreaSurf = (EGLSurface)win->eglAreaSurface;
+        m_sceneTex    = win->sceneTex;
+
+        // Single-threaded bgfx: latching bgfx::renderFrame() from this thread
+        // (the UI thread that will drive bgfx::frame() inside the GL area's
+        // render callback) keeps bgfx from spawning its own render thread, so
+        // bgfx::frame() performs the GPU submit inline on the caller.
+        bgfx::renderFrame();
+
+        // bgfx adopts the UI layer's shared pbuffer context; it must be
+        // current at bgfx::init time.
+        if (!eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext)) {
+            fprintf(stderr, "[tetris] cannot make the shared EGL context current (error 0x%x)\n", eglGetError());
+            return false;
+        }
+
+        init.type = bgfx::RendererType::OpenGL;   // the EGL backend
+        init.fallback = false;
+        init.platformData.nwh = nullptr;
+        init.platformData.ndt = nullptr;
+        init.platformData.context = win->eglContext;
+        // No backbuffer is ever used: the scene renders into sceneTex and the
+        // pbuffer is never presented (bgfx's flip() stays a no-op).
+        init.resolution.width = 1;
+        init.resolution.height = 1;
+        init.resolution.reset = 0;
+#endif
         if (!bgfx::init(init)) {
             fprintf(stderr, "[tetris] bgfx init failed\n");
             return false;
@@ -384,11 +288,14 @@ public:
 
     void shutdown() {
         if (!ok) return;
-        if (offscreen) {
-            if (bgfx::isValid(offFB)) bgfx::destroy(offFB);
-            if (bgfx::isValid(offRT)) bgfx::destroy(offRT);
-            if (bgfx::isValid(readback)) bgfx::destroy(readback);
+#if !BX_PLATFORM_OSX
+        if (m_glarea) {
+            // The scene texture storage is sceneTex (shared; bgfx never
+            // deletes it); only the bgfx handles go away here.
+            if (bgfx::isValid(sceneFB)) { bgfx::destroy(sceneFB); sceneFB = BGFX_INVALID_HANDLE; }
+            if (bgfx::isValid(sceneRT)) { bgfx::destroy(sceneRT); sceneRT = BGFX_INVALID_HANDLE; }
         }
+#endif
         if (bgfx::isValid(vbuf)) bgfx::destroy(vbuf);
         if (bgfx::isValid(atlas)) bgfx::destroy(atlas);
         if (bgfx::isValid(uTex)) bgfx::destroy(uTex);
@@ -397,49 +304,126 @@ public:
         ok = false;
     }
 
-    void endFrame() {
-        if (!ok) return;
-        if (offscreen) {
-            // First frame() hands this frame to the render thread (which runs
-            // the blit + read-back and blocks the GPU synchronously); the second
-            // frame() waits (renderSemWait) until that frame is fully processed,
-            // so frameBuf is complete on return.
-            bgfx::frame();
-            bgfx::frame();
-        } else {
-            bgfx::frame();
+    bool render(const TetrisBackend::Snapshot& s, uint32_t pw, uint32_t ph) {
+        if (!ok || pw == 0 || ph == 0) return false;
+#if !BX_PLATFORM_OSX
+        if (m_glarea) {
+            // Make the shared context current: the resize path below does raw
+            // GL work (overrideInternal) and bgfx's submit expects it too.
+            eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext);
+
+            if (pw != lastW || ph != lastH) {
+                // The UI layer re-created sceneTex at the new size before this
+                // call. Recreate the bgfx RT/FBO over it: the RT is created
+                // with the external texture id, so bgfx adopts sceneTex's
+                // storage (BGFX_SAMPLER_INTERNAL_SHARED — it never deletes it)
+                // and renders directly into the shared texture.
+                if (bgfx::isValid(sceneFB)) { bgfx::destroy(sceneFB); sceneFB = BGFX_INVALID_HANDLE; }
+                if (bgfx::isValid(sceneRT)) { bgfx::destroy(sceneRT); sceneRT = BGFX_INVALID_HANDLE; }
+                sceneRT = bgfx::createTexture2D(pw, ph, false, 1,
+                                                bgfx::TextureFormat::RGBA8, BGFX_TEXTURE_RT,
+                                                nullptr, (uint64_t)m_sceneTex);
+                sceneFB = bgfx::createFrameBuffer(1, &sceneRT);
+                lastW = pw;
+                lastH = ph;
+            }
         }
+#endif
+        verts.clear();
+        buildScene(verts, s);
+        if (verts.empty()) return false;
+
+        const bgfx::Memory* mem = bgfx::copy(verts.data(), (uint32_t)(verts.size() * sizeof(Vert)));
+        bgfx::update(vbuf, 0, mem);
+
+        float view[16], proj[16];
+        mtxIdentity(view);
+        computeOrtho(proj, pw, ph);
+        bgfx::setViewTransform(0, view, proj);
+        bgfx::setViewRect(0, 0, 0, (uint16_t)pw, (uint16_t)ph);
+#if !BX_PLATFORM_OSX
+        if (m_glarea) {
+            // Render the scene into the shared texture. No depth attachment,
+            // so clear color only (the scene is 2D and never uses depth).
+            bgfx::setViewFrameBuffer(0, sceneFB);
+            bgfx::setViewClear(0, BGFX_CLEAR_COLOR, 0x101018ff, 1.0f, 0);
+        } else
+#endif
+        {
+            bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x101018ff, 1.0f, 0);
+        }
+
+        bgfx::setTexture(0, uTex, atlas);
+        bgfx::setVertexBuffer(0, vbuf);
+        // Blending composites the text glyphs (straight alpha from the atlas)
+        // over the scene; opaque geometry (a=1) is unaffected.
+        bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_BLEND_ALPHA);
+        bgfx::submit(0, program);
+        return true;
     }
 
-    // Block until the frame most recently submitted via endFrame() has
-    // actually been presented to the native surface (its wl_surface commit
-    // flushed on Wayland). In bgfx's multithreaded mode frame N is presented
-    // by the internal render thread while processing frame N+1, so the
-    // present of frame N is only guaranteed once two further bgfx::frame()
-    // calls have returned. No-op offscreen (no native surface to present to).
+    void endFrame() {
+        if (!ok) return;
+        bgfx::frame();
+#if !BX_PLATFORM_OSX
+        if (m_glarea) {
+            // bgfx::frame() (single-threaded) just issued the scene render
+            // into sceneTex on the shared context's stream. Flush it —
+            // glFinish() flushes the FBO — so the UI thread's blit, a
+            // different context and command stream in the same share group,
+            // never samples an in-flight write.
+            eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext);
+            glFinish();
+        }
+#endif
+    }
+
     void syncPresent() {
-        if (!ok || offscreen) return;
+        if (!ok) return;
+#if !BX_PLATFORM_OSX
+        if (m_glarea) return;  // the UI layer's blit is the present
+#endif
         bgfx::frame();
         bgfx::frame();
     }
 
     void requestScreenShot(const char* path) {
+        fprintf(stderr, "[dbg] requestScreenShot(%s) ok=%d glarea=%d\n", path, (int)ok, (int)m_glarea);
         if (!ok) return;
-        if (offscreen) {
-            // frameBuf is BGRA8, top row first.
-            if (frameW != 0 && frameH != 0)
-                writeBmp(path, frameW, frameH, frameW * 4, frameBuf.data(),
-                         /*yflip=*/false, /*isBgra=*/true);
-        } else {
-            bgfx::requestScreenShot(BGFX_INVALID_HANDLE, path);
+#if !BX_PLATFORM_OSX
+        if (m_glarea) {
+            // bgfx::requestScreenShot only works on *window* frame buffers;
+            // sceneFB is a texture FBO. Read the shared scene texture back
+            // directly instead (C2 is current and flushed by endFrame()).
+            eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext);
+            glBindTexture(GL_TEXTURE_2D, m_sceneTex);
+            GLint w = 0, h = 0;
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            fprintf(stderr, "[dbg] requestScreenShot: %dx%d err=0x%x glerr=0x%x\n",
+                    w, h, eglGetError(), glGetError());
+            if (w > 0 && h > 0) {
+                // glReadPixels reads the read framebuffer, not a texture:
+                // attach sceneTex to a temporary FBO.
+                GLuint fbo = 0;
+                glGenFramebuffers(1, &fbo);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, m_sceneTex, 0);
+                std::vector<uint8_t> px((size_t)w * (size_t)h * 4);
+                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                glDeleteFramebuffers(1, &fbo);
+                // glReadPixels row 0 is the texture bottom; BMP row 0 is the
+                // bottom too — no flip.
+                writeBmp(path, (uint32_t)w, (uint32_t)h, (uint32_t)(w * 4),
+                         px.data(), false, false);
+            }
+            return;
         }
-    }
-
-    const uint8_t* framePixels(uint32_t* w, uint32_t* h) const {
-        if (!offscreen) return nullptr;
-        if (w) *w = frameW;
-        if (h) *h = frameH;
-        return frameBuf.data();
+#endif
+        bgfx::requestScreenShot(BGFX_INVALID_HANDLE, path);
     }
 
     // y0 = bottom, y1 = top (world y grows up). v grows down in the texture.
@@ -562,63 +546,15 @@ public:
         float bottom = cy - vh * 0.5f, top = cy + vh * 0.5f;
         mtxOrtho(proj, left, right, bottom, top, -1.0f, 1.0f, 0.0f, caps->homogeneousDepth);
     }
-
-    void render(const TetrisBackend::Snapshot& s, uint32_t pw, uint32_t ph) {
-        if (!ok || pw == 0 || ph == 0) return;
-        if (offscreen) {
-            if (pw != frameW || ph != frameH) resizeOffscreen(pw, ph);
-        } else if (pw != lastW || ph != lastH) {
-            bgfx::reset(pw, ph, m_resetFlags);
-            lastW = pw; lastH = ph;
-        }
-        verts.clear();
-        buildScene(verts, s);
-        if (verts.empty()) return;
-
-        const bgfx::Memory* mem = bgfx::copy(verts.data(), (uint32_t)(verts.size() * sizeof(Vert)));
-        bgfx::update(vbuf, 0, mem);
-
-        float view[16], proj[16];
-        mtxIdentity(view);
-        computeOrtho(proj, pw, ph);
-        bgfx::setViewTransform(0, view, proj);
-        bgfx::setViewRect(0, 0, 0, (uint16_t)pw, (uint16_t)ph);
-        if (offscreen) {
-            // Render the scene into the GPU render target. No depth attachment,
-            // so clear color only (the scene is 2D and never uses depth).
-            bgfx::setViewFrameBuffer(0, offFB);
-            bgfx::setViewClear(0, BGFX_CLEAR_COLOR, 0x101018ff, 1.0f, 0);
-        } else {
-            bgfx::setViewClear(0, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x101018ff, 1.0f, 0);
-        }
-
-        bgfx::setTexture(0, uTex, atlas);
-        bgfx::setVertexBuffer(0, vbuf);
-        // Blending composites the text glyphs (straight alpha from the atlas)
-        // over the scene; opaque geometry (a=1) is unaffected.
-        bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_BLEND_ALPHA);
-        bgfx::submit(0, program);
-
-        if (offscreen) {
-            // Copy the scene to the CPU-readable texture and read it back. The
-            // read-back runs on bgfx's render thread with a synchronous GPU wait;
-            // endFrame() issues the extra bgfx::frame() that blocks until it is
-            // done, so frameBuf is complete when the caller proceeds.
-            bgfx::blit(1, { .handle = readback }, { .handle = offRT });
-            bgfx::read({ .handle = readback }, frameBuf.data());
-        }
-    }
 };
 
 Renderer::Renderer() : m_impl(new Impl()) {}
 Renderer::~Renderer() {}
 bool Renderer::init(const UiWindow* win) { return m_impl->init(win); }
 void Renderer::shutdown() { m_impl->shutdown(); }
-void Renderer::render(const TetrisBackend::Snapshot& s, uint32_t w, uint32_t h) { m_impl->render(s, w, h); }
+bool Renderer::render(const TetrisBackend::Snapshot& s, uint32_t w, uint32_t h) { return m_impl->render(s, w, h); }
 void Renderer::endFrame() { m_impl->endFrame(); }
 void Renderer::syncPresent() { m_impl->syncPresent(); }
 void Renderer::requestScreenShot(const char* path) { m_impl->requestScreenShot(path); }
-const uint8_t* Renderer::framePixels(uint32_t* w, uint32_t* h) const { return m_impl->framePixels(w, h); }
-bool Renderer::offscreen() const { return m_impl->offscreen; }
 
 }  // namespace tetris

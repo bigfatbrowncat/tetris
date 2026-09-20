@@ -1,60 +1,109 @@
 // GTK4 implementation of the platform-neutral UI layer (ui/window.h).
-// X11 and Wayland are both supported. The renderer runs headless (offscreen):
-// it publishes each frame as raw BGRA8 pixels via uiPushFrame(), and we draw
-// them into a GtkDrawingArea. The window's whole content is that drawing area,
-// so there is no native handle to extract and no independent surface to commit.
+// X11 and Wayland, one code path — the glsync-x11-cairo-decorations design:
+// a resizable window whose content is a GtkGLArea, presented by the
+// compositor's frame clock.
 //
-// Resizing: onDraw() is non-blocking and always covers the full allocation —
-// first the renderer's clear color, then the latest published frame pinned
-// top-left and clipped to the area. So a freshly exposed strip is covered by
-// the clear color (which matches the scene background) immediately, with no
-// desktop gap; the game thread renders the new size on its own schedule and
-// the next draw shows it at full size.
+//   - GDK's X11 backend implements _NET_WM_SYNC_REQUEST internally and the
+//     Wayland backend paces on the frame clock: the GL area's "render"
+//     signal fires once per displayed frame. No XSync code here.
+//   - A GtkHeaderBar titlebar makes the window CSD by construction on both
+//     WMs: the compositor draws no server-side decoration — the
+//     configuration that resizes cleanly.
+//   - GSK's GL-based renderers ("ngl", the default, and "gl") composite the
+//     GL area's texture on their own resize schedule (a second, GTK-internal
+//     instance of the "resized texture != stretched region" bug) and flicker
+//     under X11/Mutter; the "cairo" renderer composites synchronously every
+//     frame, and "vulkan" is used on Wayland. The choice is made in uiInit()
+//     from the display's type, before GSK picks a renderer.
+//
+// Frame transfer (renderer -> window), GPU to GPU, no CPU copy:
+//   C1 — the GL area's context, created by GDK. The render callback runs
+//        with C1 current; the callback draws into the area's own offscreen
+//        texture, which GSK then composites into the window.
+//   C2 — a 4.3-core context sharing C1 (same share group), current in
+//        surfaceless mode (EGL_KHR_surfaceless_context) — on a 1x1 pbuffer on
+//        displays lacking that extension. bgfx adopts C2 (via
+//        Init.platformData.context) *and the surface current on it*, and skips
+//        every swap when that surface is EGL_NO_SURFACE. It renders the scene
+//        into sceneTex (a texture this layer owns) through an FBO; no view
+//        ever targets a default framebuffer, so nothing is ever presented.
+//   sceneTex — RGBA8, kept at the window's device-pixel size. Because C1 and
+//        C2 share, the callback can bind the name bgfx wrote in the other
+//        context.
+//
+// Per-frame ordering inside the render callback (bgfx is single-threaded and
+// the game runs on this thread, so all GL state transitions are on one
+// thread):
+//   1. glFinish() on C1 — the previous frame's blit read sceneTex; flush it
+//      so the texture may be rewritten. glFinish() flushes the FBO/texture
+//      writes of the current context's stream.
+//   2. Re-create sceneTex at the new size if the window resized (a freshly
+//      exposed strip must never show the desktop: step 3 clears it with the
+//      scene's background color first). This runs raw GL on C1 and must
+//      restore the FBO binding it finds (on a resize frame that is the area
+//      FBO GTK bound in attach_buffers), or step 4's blit would miss it.
+//   3. driver(w, h, dt) — the frontend: game update, scene render into
+//      sceneTex with C2, bgfx::frame(), glFinish() on C2.
+//   4. Re-bind C1, clear the area's texture with the scene's clear color and
+//      draw a full-frame quad sampling sceneTex 1:1 (pinned top-left; the
+//      texture is always exactly the window size, so nothing is stretched).
+// Epoxy before EGL: it defines __khrplatform_h_ itself, which suppresses the
+// duplicate khronos enum in the real KHR/khrplatform.h pulled in by EGL.
+#include <epoxy/gl.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <gtk/gtk.h>
-#ifdef GDK_WINDOWING_WAYLAND
-#if GTK_CHECK_VERSION(4, 18, 0)
-#include <gdk/wayland/gdkwayland.h>
-#else
-#include <gtk/gtk-wayland.h>
-#endif
-#endif
+#include <gdk/gdk.h>
 
-#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <mutex>
-#include <vector>
 #include "ui/window.h"
 
+// ---------------------------------------------------------------------------
+// state
+// ---------------------------------------------------------------------------
 static GtkWidget* s_win = nullptr;
 static GtkWidget* s_area = nullptr;
 static GtkWidget* s_header = nullptr;
 static GtkEventController* s_keyCtrl = nullptr;
 static UiWindow s_uiWindow = {UI_NWH_DEFAULT, nullptr};
-static int s_headerHeightPx = 0;
-static std::atomic<bool> s_quit{false};
 static std::mutex s_keyMutex;
 static std::deque<int> s_keys;
-static std::atomic<bool> s_sizePrinted{false};
+static volatile bool s_quit = false;
+
 static UiFrameSyncCallback s_frameSyncCb = nullptr;
 static void* s_frameSyncUser = nullptr;
+static UiFrameDriver s_frameDriver = nullptr;
+static void* s_frameDriverUser = nullptr;
+static gint64 s_lastFrameNs = 0;
 
-// Latest frame published by the game thread (raw BGRA8, top row first) and the
-// UI-thread's persistent cairo surface that presents it.
-struct FrameStore {
-    std::mutex mu;
-    std::vector<uint8_t> buf;   // BGRA pixels (written by the game thread)
-    uint32_t w = 0, h = 0;
-    uint64_t seq = 0;           // incremented on each uiPushFrame
-    uint64_t presented = 0;    // last seq drawn by onDraw
-    // UI-thread-owned, updated per draw; recreated when the frame size changes.
-    cairo_surface_t* surf = nullptr;
-    uint32_t surfW = 0, surfH = 0;
+// The GL resource pair. C1 (the area's context) is created by GDK at
+// realize; C2 and the scene texture are created here, both sharing C1's
+// share group.
+struct GLRes {
+    bool ready = false;
+    EGLDisplay display = EGL_NO_DISPLAY;
+    EGLContext areaCtx = EGL_NO_CONTEXT;    // C1
+    EGLSurface areaSurf = EGL_NO_SURFACE;   // C1's window surface
+    EGLContext bgfxCtx = EGL_NO_CONTEXT;    // C2 (shares C1)
+    EGLSurface pbuffer  = EGL_NO_SURFACE;   // C2's 1x1 placeholder surface
+    GLuint sceneTex = 0;                    // the shared scene texture
+    uint32_t texW = 0, texH = 0;
+    // The full-frame blit pipeline (built in C1).
+    GLuint blitProg = 0;
+    GLuint blitVao = 0;
+    GLuint blitVbo = 0;
+    GLint blitTexLoc = -1;
 };
-static FrameStore s_frame;
+static GLRes s_gl;
 
+// ---------------------------------------------------------------------------
+// input
+// ---------------------------------------------------------------------------
 static int mapKey(guint keyval) {
     switch (keyval) {
         case GDK_KEY_Left:  case GDK_KEY_a: return KEY_LEFT;
@@ -88,21 +137,6 @@ static gboolean onCloseRequest(GtkWindow* win, gpointer user) {
     return TRUE;
 }
 
-#ifdef GDK_WINDOWING_WAYLAND
-static int headerHeightPx(GtkWidget* header) {
-    if (header == nullptr) return 0;
-    uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(header);
-    return (int)(gtk_widget_get_height(header) * (int64_t)scale + 0.5);
-}
-
-static void onHeaderScaleFactorChanged(GObject* obj, GParamSpec* pspec, gpointer user) {
-    (void)obj; (void)pspec; (void)user;
-    if (s_header != nullptr) {
-        s_headerHeightPx = headerHeightPx(s_header);
-    }
-}
-#endif
-
 // TEMP-TEST: TETRIS_RESIZE_TEST grows the window 640->1240 in steps (like a
 // drag), releases the constraint, then maximizes (big grow) and unmaximizes
 // (big shrink back) to exercise both directions.
@@ -131,69 +165,369 @@ static gboolean resizeTestTick(gpointer user) {
     return step <= 28 ? G_SOURCE_CONTINUE : G_SOURCE_REMOVE;
 }
 
-// Draw callback (GTK_PAINT). width/height are logical pixels; cr is pre-scaled
-// by the scale factor. We paint a device-size frame 1:1 in device pixels, so we
-// undo that scaling for the frame. The clear-color underlay covers the full
-// allocation first (see the file header).
-static void onDraw(GtkDrawingArea* area, cairo_t* cr, int width, int height, gpointer user) {
-    (void)user;
-    uint32_t scale = (uint32_t)gtk_widget_get_scale_factor(GTK_WIDGET(area));
-    uint32_t devW = (uint32_t)width * scale;
-    uint32_t devH = (uint32_t)height * scale;
+// ---------------------------------------------------------------------------
+// the full-frame blit (C1): one oversized triangle covering the viewport,
+// sampling sceneTex 1:1. sceneTex is always exactly the window's device size
+// (re-created on resize, step 2), so the quad is a pure 1:1 copy — no
+// scaling, no stretching of a stale frame.
+// ---------------------------------------------------------------------------
+static const char *BLIT_VS =
+    "#version 330 core\n"
+    "layout(location = 0) in vec2 in_pos;   /* NDC, [-1, 1] */\n"
+    "layout(location = 1) in vec2 in_uv;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "    v_uv = in_uv;\n"
+    "    gl_Position = vec4(in_pos, 0.0, 1.0);\n"
+    "}\n";
 
-    // 1) Cover the whole allocation with the renderer's clear color, so a
-    //    freshly exposed strip never shows the desktop (no gap).
-    cairo_set_source_rgb(cr, 16.0 / 255.0, 16.0 / 255.0, 24.0 / 255.0);
-    cairo_paint(cr);
+static const char *BLIT_FS =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "uniform sampler2D s_tex;\n"
+    "out vec4 out_color;\n"
+    "void main() { out_color = vec4(texture(s_tex, v_uv).rgb, 1.0); }\n";
 
-    // 2) Draw the latest published frame at native size, pinned top-left and
-    //    clipped to the area (1:1 device pixels -> undo the scale factor).
-    //    The frame is BGRA8; we convert it to an opaque CAIRO_FORMAT_RGB24
-    //    surface (bytes B,G,R, no alpha). The scene is fully opaque, and an
-    //    explicit opaque format avoids any premultiplied-alpha misinterpretation
-    //    of the straight-alpha readback bytes by the GSK renderer.
-    cairo_surface_t* surf = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(s_frame.mu);
-        if (s_frame.seq != 0 && s_frame.buf.size() == (size_t)s_frame.w * s_frame.h * 4) {
-            if (s_frame.surf == nullptr || s_frame.surfW != s_frame.w ||
-                s_frame.surfH != s_frame.h) {
-                // Drops our reference only; any in-flight GSK reference keeps the
-                // old surface alive until that frame has rendered.
-                if (s_frame.surf != nullptr) cairo_surface_destroy(s_frame.surf);
-                s_frame.surf = cairo_image_surface_create(CAIRO_FORMAT_RGB24,
-                                                          s_frame.w, s_frame.h);
-                s_frame.surfW = s_frame.w;
-                s_frame.surfH = s_frame.h;
-            }
-            // RGB24 is a 32-bit format: 4 bytes/pixel laid out [B,G,R,0]. Our
-            // BGRA frame is [B,G,R,A]. A straight memcpy lands B,G,R correctly;
-            // cairo ignores the 4th byte of an RGB24 surface (no alpha), so the
-            // carried-over A is harmless. (Writing 3 bytes/pixel here would
-            // misalign against cairo's 4-byte stride and scramble the colors.)
-            memcpy(cairo_image_surface_get_data(s_frame.surf), s_frame.buf.data(),
-                   s_frame.buf.size());
-            surf = s_frame.surf;
-            s_frame.presented = s_frame.seq;
-        }
+static GLuint compileShader(GLenum type, const char* src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[512];
+        glGetShaderInfoLog(sh, sizeof log, NULL, log);
+        g_warning("blit shader compile failed: %s", log);
     }
-    if (surf != nullptr) {
-        cairo_scale(cr, 1.0 / (double)scale, 1.0 / (double)scale);
-        cairo_set_source_surface(cr, surf, 0, 0);
-        cairo_paint(cr);
-        // surf is persistent (owned by s_frame); GSK holds its own reference
-        // until the frame has rendered, so we do not destroy it here.
-    }
-
-    // 3) Hand the new size to the game thread (non-blocking) so it renders this
-    //    size on its next iteration.
-    if (s_frameSyncCb != nullptr) {
-        s_frameSyncCb(devW, devH, s_frameSyncUser);
-    }
+    return sh;
 }
 
+// C1 is current. Builds the blit program + VAO/VBO once.
+static void blitBuild(void) {
+    if (s_gl.blitProg != 0) return;
+
+    GLuint vs = compileShader(GL_VERTEX_SHADER,   BLIT_VS);
+    GLuint fs = compileShader(GL_FRAGMENT_SHADER, BLIT_FS);
+
+    s_gl.blitProg = glCreateProgram();
+    glAttachShader(s_gl.blitProg, vs);
+    glAttachShader(s_gl.blitProg, fs);
+    glLinkProgram(s_gl.blitProg);
+
+    GLint linked = 0;
+    glGetProgramiv(s_gl.blitProg, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        char log[512];
+        glGetProgramInfoLog(s_gl.blitProg, sizeof log, NULL, log);
+        g_warning("blit program link failed: %s", log);
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    s_gl.blitTexLoc = glGetUniformLocation(s_gl.blitProg, "s_tex");
+
+    // One triangle covering the viewport (uv overscans to 2; CLAMP_TO_EDGE
+    // makes the edge texels repeat, so no seam).
+    const GLfloat verts[12] = {
+        -1.0f, -1.0f, 0.0f, 0.0f,
+         3.0f, -1.0f, 2.0f, 0.0f,
+        -1.0f,  3.0f, 0.0f, 2.0f,
+    };
+    glGenVertexArrays(1, &s_gl.blitVao);
+    glGenBuffers(1, &s_gl.blitVbo);
+    glBindVertexArray(s_gl.blitVao);
+    glBindBuffer(GL_ARRAY_BUFFER, s_gl.blitVbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof verts, verts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * 2 * sizeof(GLfloat), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 2 * 2 * sizeof(GLfloat), (void*)(2 * sizeof(GLfloat)));
+    glEnableVertexAttribArray(1);
+    glBindVertexArray(0);
+}
+
+// C1 is current. Keeps sceneTex allocated at (w, h); on (re)creation it is
+// filled with the scene's clear color so a blit before the first rendered
+// frame (or a freshly exposed resize strip) shows the background, never
+// undefined storage.
+static void sceneTexEnsure(uint32_t w, uint32_t h) {
+    if (s_gl.sceneTex == 0) glGenTextures(1, &s_gl.sceneTex);
+    if (s_gl.sceneTex == 0) return;
+    if (s_gl.texW == w && s_gl.texH == h) return;
+
+    glBindTexture(GL_TEXTURE_2D, s_gl.sceneTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
+                 GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    s_gl.texW = w;
+    s_gl.texH = h;
+
+    // Clear the fresh storage with the scene's background (0x101018).
+    // Save/restore the FBO binding: on a resize frame GTK has already bound
+    // the GL area's FBO (attach_buffers, before the render signal) and the
+    // full-frame blit later draws into it. Binding 0 here would send the
+    // blit to the default framebuffer and leave the freshly re-allocated
+    // area texture holding the previous frame re-pitched at the new size —
+    // the per-row horizontal shift seen while resizing.
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, s_gl.sceneTex, 0);
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    glClearColor(16.0f / 255.0f, 16.0f / 255.0f, 24.0f / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
+    glDeleteFramebuffers(1, &fbo);
+}
+
+// ---------------------------------------------------------------------------
+// GL setup: grab the area's context (C1), create C2 sharing it on a pbuffer,
+// and the scene texture. Called once after the area is realized.
+// ---------------------------------------------------------------------------
+static bool setupGL(uint32_t w, uint32_t h) {
+    gtk_gl_area_make_current(GTK_GL_AREA(s_area));
+    GError* err = gtk_gl_area_get_error(GTK_GL_AREA(s_area));
+    if (err != NULL) {
+        g_warning("GL area realize error: %s", err->message);
+        return false;
+    }
+
+    // GDK creates the area's context with GLX when the X11 server has no
+    // usable EGL. This bgfx build's GL backend is EGL-only, and a GLX
+    // context cannot share with an EGL one — fail loudly in that case.
+    EGLContext c1 = eglGetCurrentContext();
+    if (c1 == EGL_NO_CONTEXT) {
+        fprintf(stderr,
+            "[window] FATAL: the GTK GL context is not EGL (GLX fallback on this"
+            " X11 server). The EGL bgfx backend requires an EGL display context;"
+            " texture sharing with a GLX context is not possible.\n");
+        return false;
+    }
+
+    s_gl.display  = eglGetCurrentDisplay();
+    s_gl.areaCtx  = c1;
+    s_gl.areaSurf = eglGetCurrentSurface(EGL_DRAW);
+
+    // The client API is bound per-thread, per-display. This thread must be
+    // bound to the desktop OpenGL API to create desktop contexts (GDK does
+    // the same before creating the area's context).
+    if (!eglBindAPI(EGL_OPENGL_API)) {
+        fprintf(stderr, "[window] FATAL: eglBindAPI(EGL_OPENGL_API) failed (error 0x%x)\n", eglGetError());
+        return false;
+    }
+
+    // C2 needs a way to be current. Prefer surfaceless
+    // (EGL_KHR_surfaceless_context): the Wayland platform display the GL
+    // area's context lives on exposes no PBUFFER configs, and surfaceless
+    // needs no surface at all.
+    const char* exts = eglQueryString(s_gl.display, EGL_EXTENSIONS);
+    const bool surfaceless =
+        exts != nullptr && strstr(exts, "EGL_KHR_surfaceless_context") != nullptr;
+
+    // A config, when one is needed (the pbuffer fallback).
+    EGLConfig cfg = NULL;
+    if (!surfaceless) {
+        const EGLint cfgAttrs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+            EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+            EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
+            EGL_NONE,
+        };
+        EGLint num = 0;
+        if (!eglChooseConfig(s_gl.display, cfgAttrs, &cfg, 1, &num) || num < 1) {
+            fprintf(stderr, "[window] FATAL: no EGL pbuffer config (error 0x%x)\n", eglGetError());
+            return false;
+        }
+    }
+
+    // C2: desktop core 4.3 (bgfx's OpenGL requirement), sharing C1's group.
+    // Some platform displays (Wayland) expose only *configless* contexts —
+    // their configs exist for visual matching but cannot create contexts
+    // (GDK itself creates the area's context configless). Try config-based
+    // first, then configless (EGL_MESA_configless_context).
+    if (getenv("TETRIS_EGL_DEBUG")) {
+        const char* v1 = (const char*)glGetString(GL_VERSION);
+        fprintf(stderr, "[dbg] C1 GL version: %s\n", v1 ? v1 : "(null)");
+        EGLint c1cfgId = 0;
+        eglQueryContext(s_gl.display, c1, EGL_CONFIG_ID, &c1cfgId);
+        fprintf(stderr, "[dbg] C1 config id=%d\n", c1cfgId);
+        // a real window config, like GDK's
+        EGLint wcfg[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
+                          EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE };
+        EGLConfig wc = NULL; EGLint wn = 0;
+        eglChooseConfig(s_gl.display, wcfg, &wc, 1, &wn);
+        fprintf(stderr, "[dbg] window config: %d found\n", wn);
+        for (int maj = 3; maj <= 5; maj++)
+        for (int min = 0; min <= 6; min++) {
+            if (maj == 3 && min < 3) continue;
+            if (maj == 5 && min > 2) continue;
+            if (wc) {
+                EGLint a[] = { EGL_CONTEXT_MAJOR_VERSION, maj, EGL_CONTEXT_MINOR_VERSION, min, EGL_NONE };
+                EGLContext t = eglCreateContext(s_gl.display, wc, EGL_NO_CONTEXT, a);
+                if (t != EGL_NO_CONTEXT) {
+                    fprintf(stderr, "[dbg] withconfig %d.%d OK (no profile) err=0x%x\n", maj, min, eglGetError());
+                    eglDestroyContext(s_gl.display, t);
+                }
+            }
+            EGLint ap[] = { EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+                            EGL_CONTEXT_MAJOR_VERSION, maj, EGL_CONTEXT_MINOR_VERSION, min, EGL_NONE };
+            EGLContext tp = eglCreateContext(s_gl.display, NULL, EGL_NO_CONTEXT, ap);
+            if (tp != EGL_NO_CONTEXT) {
+                fprintf(stderr, "[dbg] configless %d.%d OK (core)\n", maj, min);
+                eglDestroyContext(s_gl.display, tp);
+            }
+        }
+        EGLint as_[] = { EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 3,
+                         EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE };
+        EGLContext ts = eglCreateContext(s_gl.display, NULL, c1, as_);
+        fprintf(stderr, "[dbg] configless 4.3-core share C1: %p err=0x%x\n", (void*)ts, eglGetError());
+        if (ts != EGL_NO_CONTEXT) eglDestroyContext(s_gl.display, ts);
+        if (wc) {
+            EGLContext tw = eglCreateContext(s_gl.display, wc, c1, as_);
+            fprintf(stderr, "[dbg] withconfig 4.3-core share C1: %p err=0x%x\n", (void*)tw, eglGetError());
+            if (tw != EGL_NO_CONTEXT) eglDestroyContext(s_gl.display, tw);
+        }
+    }
+
+    const EGLint ctxAttrs[] = {
+        EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
+        EGL_CONTEXT_MAJOR_VERSION_KHR, 4,
+        EGL_CONTEXT_MINOR_VERSION_KHR, 3,
+        EGL_NONE,
+    };
+    s_gl.bgfxCtx = eglCreateContext(s_gl.display, cfg, c1, ctxAttrs);
+    if (s_gl.bgfxCtx == EGL_NO_CONTEXT)
+        s_gl.bgfxCtx = eglCreateContext(s_gl.display, NULL, c1, ctxAttrs);
+    if (s_gl.bgfxCtx == EGL_NO_CONTEXT)
+        s_gl.bgfxCtx = eglCreateContext(s_gl.display, NULL, c1, NULL);
+    if (s_gl.bgfxCtx == EGL_NO_CONTEXT) {
+        fprintf(stderr, "[window] FATAL: cannot create the shared EGL context (error 0x%x)\n", eglGetError());
+        return false;
+    }
+
+    if (!surfaceless) {
+        const EGLint pbAttrs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
+        s_gl.pbuffer = eglCreatePbufferSurface(s_gl.display, cfg, pbAttrs);
+        if (s_gl.pbuffer == EGL_NO_SURFACE) {
+            fprintf(stderr, "[window] FATAL: cannot create the 1x1 pbuffer (error 0x%x)\n", eglGetError());
+            return false;
+        }
+    }
+    // Make C2 current — on the pbuffer, or surfaceless (EGL_NO_SURFACE).
+    // bgfx adopts whichever surface is current at bgfx::init time.
+    if (!eglMakeCurrent(s_gl.display, s_gl.pbuffer, s_gl.pbuffer, s_gl.bgfxCtx)) {
+        fprintf(stderr, "[window] FATAL: cannot make the shared context current (error 0x%x)\n", eglGetError());
+        return false;
+    }
+
+    // The scene texture (shared group: visible from C1 and C2 alike).
+    glGenTextures(1, &s_gl.sceneTex);
+    sceneTexEnsure(w, h);
+
+    // The blit pipeline lives in C1.
+    if (!eglMakeCurrent(s_gl.display, s_gl.areaSurf, s_gl.areaSurf, s_gl.areaCtx)) {
+        fprintf(stderr, "[window] FATAL: cannot re-bind the area context (error 0x%x)\n", eglGetError());
+        return false;
+    }
+    blitBuild();
+    s_gl.ready = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// the render callback — the whole present path (see the file header).
+// ---------------------------------------------------------------------------
+static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) {
+    (void)area; (void)context; (void)user;
+    if (getenv("TETRIS_EGL_DEBUG")) {
+        static int n = 0;
+        fprintf(stderr, "[dbg] onRender #%d ready=%d\n", ++n, (int)s_gl.ready);
+    }
+    if (!s_gl.ready) return TRUE;
+
+    // C1 is current (GTK made it so before emitting "render").
+    const int scale = gtk_widget_get_scale_factor(GTK_WIDGET(s_area));
+    const uint32_t w = (uint32_t)gtk_widget_get_width(GTK_WIDGET(s_area)) * (uint32_t)scale;
+    const uint32_t h = (uint32_t)gtk_widget_get_height(GTK_WIDGET(s_area)) * (uint32_t)scale;
+    if (w == 0 || h == 0) return TRUE;
+
+    // 1) The previous frame's blit read sceneTex from C1's stream; flush it
+    //    so the texture may be re-written (glFinish() flushes the FBO).
+    glFinish();
+
+    // 2) Keep the shared scene texture at the current device size.
+    sceneTexEnsure(w, h);
+
+    // 3) Drive the game: update + render the scene into sceneTex (C2) +
+    //    bgfx::frame() + glFinish() on C2.
+    if (s_frameDriver != nullptr) {
+        double dt = 0.0;
+        const gint64 now = g_get_monotonic_time();
+        if (s_lastFrameNs != 0) dt = (now - s_lastFrameNs) * 1e-6;
+        s_lastFrameNs = now;
+        s_frameDriver(w, h, dt, s_frameDriverUser);
+    }
+
+    // 4) Present: re-bind C1, clear with the scene's background (covers a
+    //    freshly exposed resize strip) and copy sceneTex full-frame, 1:1.
+    if (!eglMakeCurrent(s_gl.display, s_gl.areaSurf, s_gl.areaSurf, s_gl.areaCtx)) {
+        fprintf(stderr, "[window] FATAL: cannot re-bind the area context (error 0x%x)\n", eglGetError());
+        return TRUE;
+    }
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    glClearColor(16.0f / 255.0f, 16.0f / 255.0f, 24.0f / 255.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (s_gl.sceneTex != 0) {
+        glUseProgram(s_gl.blitProg);
+        glUniform1i(s_gl.blitTexLoc, 0);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, s_gl.sceneTex);
+        glBindVertexArray(s_gl.blitVao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+    }
+
+    return TRUE;  // we handled the draw
+}
+
+// ---------------------------------------------------------------------------
+// frame pump: GtkGLArea emits "render" only when the widget is drawn, and a
+// static scene never invalidates itself (queue_draw *during* the snapshot
+// does not schedule the next frame on GTK 4.18 / GNOME Shell). A short timer
+// keeps the area invalidated, so the frame clock ticks continuously; the
+// actual pacing is the compositor's (the render callback runs once per
+// displayed frame, and the game uses the real dt).
+// ---------------------------------------------------------------------------
+static gboolean framePumpTick(gpointer user) {
+    (void)user;
+    if (s_area != nullptr) gtk_widget_queue_draw(s_area);
+    return G_SOURCE_CONTINUE;
+}
+
+// ---------------------------------------------------------------------------
+// the UI layer API
+// ---------------------------------------------------------------------------
 void uiInit(void) {
     gtk_init();
+
+    // Pick the GSK renderer from the display type, before GSK picks one:
+    // the GL-based GSK renderers resize the GL area's texture on their own
+    // schedule (flicker under X11/Mutter); "cairo" composites synchronously
+    // (X11), "vulkan" on Wayland.
+    GdkDisplay* display = gdk_display_get_default();
+    if (display != NULL) {
+        const char* backend_type = G_OBJECT_TYPE_NAME(display);
+        if (g_strcmp0(backend_type, "GdkWaylandDisplay") == 0) {
+            g_setenv("GSK_RENDERER", "vulkan", TRUE);
+        } else if (g_strcmp0(backend_type, "GdkX11Display") == 0) {
+            g_setenv("GSK_RENDERER", "cairo", TRUE);
+        }
+    }
 }
 
 const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
@@ -201,38 +535,31 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     gtk_window_set_title(GTK_WINDOW(s_win), title);
     gtk_window_set_default_size(GTK_WINDOW(s_win), (int)w, (int)h);
 
-    // The whole content is a drawing area that presents the frames the
-    // (headless) renderer publishes.
-    s_area = gtk_drawing_area_new();
+    // A GtkHeaderBar as the titlebar makes this window CSD: the compositor
+    // draws no server-side decoration at all, and the usual window controls
+    // are drawn by GTK itself. Both X11 and Wayland.
+    s_header = gtk_header_bar_new();
+    gtk_header_bar_set_title_widget(GTK_HEADER_BAR(s_header), gtk_label_new(title));
+    gtk_window_set_titlebar(GTK_WINDOW(s_win), s_header);
+
+    s_area = gtk_gl_area_new();
+    // Desktop GL 3.3 core for the blit pipeline (the scene texture and the
+    // full-frame quad); the game itself renders in the 4.3 context C2.
+    gtk_gl_area_set_use_es(GTK_GL_AREA(s_area), FALSE);
+    gtk_gl_area_set_required_version(GTK_GL_AREA(s_area), 3, 3);
     gtk_widget_set_focusable(s_area, TRUE);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(s_area), onDraw, nullptr, nullptr);
+    g_signal_connect(s_area, "render", G_CALLBACK(onRender), nullptr);
     gtk_window_set_child(GTK_WINDOW(s_win), s_area);
 
+    // The window background shows for a moment before the first frame is
+    // painted. Match the renderer's clear color (0x101018) so the transient
+    // gap is seamless.
     GdkDisplay* display = gdk_display_get_default();
-    // The window background shows for a moment during a resize, before the first
-    // frame at the new size is painted. Match the renderer's clear color
-    // (0x101018, frontend/renderer.cpp) so the transient gap is seamless.
     GtkCssProvider* cssProvider = gtk_css_provider_new();
     gtk_css_provider_load_from_string(cssProvider, "window { background: #101018; }");
     gtk_style_context_add_provider_for_display(
         display, GTK_STYLE_PROVIDER(cssProvider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(cssProvider);
-
-#ifdef GDK_WINDOWING_WAYLAND
-    if (GDK_IS_WAYLAND_DISPLAY(display)) {
-        g_setenv("GSK_RENDERER", "cairo", TRUE);
-        g_setenv("GDK_GL_DISABLE", "1", TRUE);
-        s_header = gtk_header_bar_new();
-        GtkWidget* titleLabel = gtk_label_new(title);
-        gtk_header_bar_set_title_widget(GTK_HEADER_BAR(s_header), titleLabel);
-        gtk_header_bar_set_decoration_layout(GTK_HEADER_BAR(s_header), ":close");
-        gtk_window_set_titlebar(GTK_WINDOW(s_win), s_header);
-        g_signal_connect(s_header, "notify::scale-factor",
-                         G_CALLBACK(onHeaderScaleFactorChanged), nullptr);
-    }
-#else
-    (void)display;
-#endif
 
     // GTK4 widgets do NOT own event controllers: keep our reference alive for
     // the window's lifetime and remove it in uiShutdown() before destroy.
@@ -245,17 +572,44 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     gtk_window_present(GTK_WINDOW(s_win));
     gtk_widget_grab_focus(s_area);
 
-    // Pump until the window is realized and the content child has an allocation.
+    // Pump until the area is realized and has an allocation.
     for (int i = 0; i < 200 &&
-          (!gtk_widget_get_realized(s_win) || gtk_widget_get_height(s_area) == 0); i++)
+          (!gtk_widget_get_realized(s_area) || gtk_widget_get_height(s_area) == 0); i++)
         uiPumpEvents(0.005);
+
     if (std::getenv("TETRIS_RESIZE_TEST")) g_timeout_add(100, resizeTestTick, nullptr);
 
-    // The renderer runs headless: no native window handle is needed.
+    // The continuous frame pump (see framePumpTick).
+    g_timeout_add(16, framePumpTick, nullptr);
+
+    const int scale = gtk_widget_get_scale_factor(s_area);
+    const uint32_t devW = (uint32_t)gtk_widget_get_width(s_area) * (uint32_t)scale;
+    const uint32_t devH = (uint32_t)gtk_widget_get_height(s_area) * (uint32_t)scale;
+    if (!setupGL(devW, devH)) {
+        GError* gerr = nullptr;
+        g_set_error(&gerr, GDK_GL_ERROR, GDK_GL_ERROR_NOT_AVAILABLE,
+                    "EGL context pair setup failed");
+        gtk_gl_area_set_error(GTK_GL_AREA(s_area), gerr);
+        g_clear_error(&gerr);
+    } else {
+        // Kick the frame loop: the first "render" may have fired before the
+        // GL pair was ready (and returned early), so invalidate once more.
+        gtk_widget_queue_draw(s_area);
+    }
+
     s_uiWindow.nwhType = UI_NWH_DEFAULT;
     s_uiWindow.nwh = nullptr;
     s_uiWindow.ndt = nullptr;
-    s_uiWindow.offscreen = 1;
+    s_uiWindow.offscreen = 1;  // the renderer renders into the shared scene texture
+    s_uiWindow.eglDisplay     = s_gl.ready ? (void*)s_gl.display  : nullptr;
+    s_uiWindow.eglContext     = s_gl.ready ? (void*)s_gl.bgfxCtx  : nullptr;
+    s_uiWindow.eglPbuffer     = s_gl.ready ? (void*)s_gl.pbuffer  : nullptr;
+    s_uiWindow.eglAreaSurface = s_gl.ready ? (void*)s_gl.areaSurf : nullptr;
+    s_uiWindow.sceneTex       = s_gl.ready ? s_gl.sceneTex : 0;
+    if (getenv("TETRIS_EGL_DEBUG"))
+        fprintf(stderr, "[dbg] ready=%d display=%p ctx=%p pbuf=%p areaSurf=%p sceneTex=%u\n",
+                (int)s_gl.ready, s_uiWindow.eglDisplay, s_uiWindow.eglContext,
+                s_uiWindow.eglPbuffer, s_uiWindow.eglAreaSurface, s_uiWindow.sceneTex);
     return &s_uiWindow;
 }
 
@@ -270,31 +624,17 @@ void uiPumpEvents(double timeoutSec) {
     } while (g_get_monotonic_time() < deadline);
 }
 
-// Nothing to commit: GTK's own frame clock presents the drawing area.
+// Nothing to commit: GTK's frame clock presents the GL area's texture.
 void uiCommitFrame(void) {}
-
-void uiPushFrame(uint32_t w, uint32_t h, const uint8_t* bgra) {
-    std::lock_guard<std::mutex> lk(s_frame.mu);
-    const size_t n = (size_t)w * (size_t)h * 4u;
-    if (s_frame.buf.size() != n) s_frame.buf.resize(n);
-    if (bgra != nullptr && n != 0) memcpy(s_frame.buf.data(), bgra, n);
-    s_frame.w = w;
-    s_frame.h = h;
-    s_frame.seq++;
-}
-
-void uiPresentFrame(void) {
-    bool fresh = false;
-    {
-        std::lock_guard<std::mutex> lk(s_frame.mu);
-        fresh = (s_frame.seq != s_frame.presented);
-    }
-    if (fresh && s_area != nullptr) gtk_widget_queue_draw(s_area);
-}
 
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData) {
     s_frameSyncCb = cb;
     s_frameSyncUser = userData;
+}
+
+void uiSetFrameDriver(UiFrameDriver cb, void* userData) {
+    s_frameDriver = cb;
+    s_frameDriverUser = userData;
 }
 
 int uiShouldQuit(void) {
@@ -318,19 +658,31 @@ void uiWindowSize(uint32_t* w, uint32_t* h) {
     }
     if (w) *w = pw;
     if (h) *h = ph;
-    if (pw != 0 && ph != 0 && !s_sizePrinted.exchange(true)) {
-        fprintf(stderr, "[window] size %ux%u header=%d\n", pw, ph, s_headerHeightPx);
-    }
 }
 
 void uiShutdown(void) {
-    {
-        std::lock_guard<std::mutex> lk(s_frame.mu);
-        if (s_frame.surf != nullptr) {
-            cairo_surface_destroy(s_frame.surf);
-            s_frame.surf = nullptr;
+    if (s_gl.ready) {
+        // C1 current for the objects it owns (scene texture, blit pipeline).
+        eglMakeCurrent(s_gl.display, s_gl.areaSurf, s_gl.areaSurf, s_gl.areaCtx);
+        if (s_gl.sceneTex != 0) {
+            glDeleteTextures(1, &s_gl.sceneTex);
+            s_gl.sceneTex = 0;
         }
-        s_frame.buf.clear();
+        if (s_gl.blitProg != 0) glDeleteProgram(s_gl.blitProg);
+        if (s_gl.blitVbo != 0) glDeleteBuffers(1, &s_gl.blitVbo);
+        if (s_gl.blitVao != 0) glDeleteVertexArrays(1, &s_gl.blitVao);
+        // Release and destroy C2 (it must go away before the window destroy
+        // releases C1, the context it shares with).
+        eglMakeCurrent(s_gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (s_gl.bgfxCtx != EGL_NO_CONTEXT) {
+            eglDestroyContext(s_gl.display, s_gl.bgfxCtx);
+            s_gl.bgfxCtx = EGL_NO_CONTEXT;
+        }
+        if (s_gl.pbuffer != EGL_NO_SURFACE) {
+            eglDestroySurface(s_gl.display, s_gl.pbuffer);
+            s_gl.pbuffer = EGL_NO_SURFACE;
+        }
+        s_gl.ready = false;
     }
     if (s_win != nullptr) {
         // The widget does not own the controller (it is not ref'd on add);

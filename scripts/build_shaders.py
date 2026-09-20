@@ -7,8 +7,9 @@ Writes ONLY to <out-dir> (a directory inside the CMake build tree):
   <out-dir>/vs_quad.h   <out-dir>/fs_quad.h
 
 macOS  -> Metal shaders
-Linux  -> SPIR-V (profile "spirv" = SPIR-V 1.0 / Vulkan 1.0,
-           accepted by all drivers)
+Linux  -> GLSL 4.30 text (profile "430") — bgfx's OpenGL/EGL backend
+           compiles the embedded GLSL; it needs a desktop GLSL source, not
+           SPIR-V.
 """
 import os
 import subprocess
@@ -19,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 IS_MACOS = sys.platform == "darwin"
 PLATFORM = "osx" if IS_MACOS else "linux"
-PROFILE = "metal" if IS_MACOS else "spirv"
+PROFILE = "metal" if IS_MACOS else "430"
 
 # Defaults for running the script standalone (no CMake).
 DEFAULT_SHADERC = os.path.join(

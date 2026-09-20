@@ -27,10 +27,32 @@ typedef struct {
 	uint32_t nwhType;   // UI_NWH_*
 	void*    nwh;
 	void*    ndt;      // native display: X11 Display* / Wayland wl_display* (or NULL)
-	// 1: the renderer runs headless (nwh/ndt unused) and publishes each frame as
-	// raw BGRA8 pixels via uiPushFrame(); the UI layer presents them (GTK draws
-	// them into a GtkDrawingArea). 0: the renderer presents to nwh directly.
+	// 1: the renderer renders offscreen into a shared GL texture that the UI
+	//    layer presents as a full-frame quad inside a GtkGLArea (the GTK GL
+	//    area path, X11 + Wayland — GPU to GPU, no CPU copy). nwh/ndt are
+	//    unused. 0: the renderer presents to nwh directly (macOS).
 	uint32_t offscreen;
+	// GTK GL area path only (offscreen == 1); all values are EGL types:
+	//   eglDisplay      — the EGLDisplay everything shares.
+	//   eglContext      — the EGL context bgfx adopts (bgfx::Init.platformData
+	//                     .context); shares the GL area's context and is
+	//                     current (surfaceless, or on a 1x1 pbuffer).
+	//   eglPbuffer      — the surface C2 is current on (never presented);
+	//                     NULL when the context is surfaceless.
+	//   eglAreaSurface  — the GL area context's window surface (NULL when the
+	//                     context is surfaceless, e.g. on Wayland; the UI
+	//                     layer re-binds the context surfaceless before
+	//                     presenting the quad).
+	//   sceneTex        — GL texture name (RGBA8) the renderer draws the scene
+	//                     into; owned by the UI layer, kept at the window's
+	//                     device-pixel size, visible in every context of the
+	//                     share group.
+	// NULL / 0 on other platforms.
+	void*    eglDisplay;
+	void*    eglContext;
+	void*    eglPbuffer;
+	void*    eglAreaSurface;
+	uint32_t sceneTex;
 } UiWindow;
 
 // Create the UI toolkit (app + menu). Call once on the main thread.
@@ -52,40 +74,31 @@ int uiPopKey(void);
 // Current drawable (pixel) size of the window content.
 void uiWindowSize(uint32_t* w, uint32_t* h);
 
-// Commit the frame (present the new window size to the compositor). On Wayland
-// this commits the root surface; on other backends it is a no-op. On Wayland
-// the content (a subsurface committed independently by the renderer) may lag
-// this commit by up to one frame; the window background matches the
-// renderer's clear color, so the gap is invisible.
+// Commit the frame (present the new window size to the compositor). On other
+// backends this is a no-op (GTK's frame clock already presents; the GL area
+// path draws into an offscreen texture that GSK composites, so there is no
+// independent surface to commit).
 void uiCommitFrame(void);
 
-// Frame-sync hook. On Wayland the rendered content is a subsurface committed
-// independently of the root; the UI layer calls cb() from the surface "layout"
-// signal (LAYOUT phase: after widget allocation, before PAINT) with the new
-// content size in pixels. cb() hands the size to the renderer, which resizes +
-// commits the subsurface asynchronously — the root commits the new size
-// immediately (no resize lag) and the window background (matched to the
-// renderer's clear color) covers the gap until the content lands. On macOS the
-// UI layer calls cb() from windowDidResize: so the Metal canvas repaints
-// synchronously inside the resize notification (continuous resizing while
-// dragging the window edge; the previous frame stays pinned top-left, not
-// stretched, until the new one is presented). On other backends this is a
-// no-op (the main loop's repaintSynchronous + uiCommitFrame ordering already
-// suffices).
+// Frame-sync hook. On macOS the UI layer calls cb() from windowDidResize: so
+// the Metal canvas repaints synchronously inside the resize notification
+// (continuous resizing while dragging the window edge; the previous frame
+// stays pinned top-left, not stretched, until the new one is presented).
+// On the GTK GL area path it is never called: the render callback below
+// already knows the new size and resizes the scene texture itself.
 typedef void (*UiFrameSyncCallback)(uint32_t pixelW, uint32_t pixelH, void* userData);
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData);
 
-// Offscreen frame handoff (renderer runs headless, publishes raw pixels).
-//
-// uiPushFrame(): call from the game thread after the renderer has read back a
-// frame. w/h are in device pixels, bgra points at w*h*4 bytes in B,G,R,A
-// order, top row first. The UI layer copies it; bgra may be reused/freed
-// after the call returns.
-void uiPushFrame(uint32_t w, uint32_t h, const uint8_t* bgra);
-
-// uiPresentFrame(): call from the main thread each frame; asks the UI layer to
-// repaint with the latest pushed frame if one is pending.
-void uiPresentFrame(void);
+// GTK GL area path only: the game driver. The UI layer calls
+// cb(devicePixelW, devicePixelH, dtSeconds, userData) from the GtkGLArea
+// "render" callback — once per displayed frame, paced by the compositor's
+// frame clock — with the GL area's context current. cb() updates the game and
+// renders the scene into UiWindow.sceneTex (single-threaded bgfx driven on
+// this thread: bgfx::frame() followed by glFinish() so the texture write is
+// complete on return). The UI layer then presents sceneTex as a full-frame
+// quad into the window. Never called on other platforms.
+typedef void (*UiFrameDriver)(uint32_t pixelW, uint32_t pixelH, double dt, void* userData);
+void uiSetFrameDriver(UiFrameDriver cb, void* userData);
 
 void uiShutdown(void);
 

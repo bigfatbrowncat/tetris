@@ -157,19 +157,18 @@ void uiWindowSize(uint32_t* w, uint32_t* h) {
 // do here.
 void uiCommitFrame(void) {}
 
-// Offscreen frame handoff: unused on macOS (offscreen == 0, the renderer
-// presents to the window directly).
-void uiPushFrame(uint32_t w, uint32_t h, const uint8_t* bgra) {
-    (void)w; (void)h; (void)bgra;
-}
-void uiPresentFrame(void) {}
-
 // Frame-sync hook: windowDidResize: calls cb() with the new content pixel size
 // so the renderer repaints synchronously inside the resize notification
 // (continuous resizing while dragging the window edge).
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData) {
     s_frameSyncCb = cb;
     s_frameSyncUser = userData;
+}
+
+// GL-area frame driver: unused on macOS (the renderer presents to the window
+// directly from its own thread).
+void uiSetFrameDriver(UiFrameDriver cb, void* userData) {
+    (void)cb; (void)userData;
 }
 
 void uiShutdown(void) {

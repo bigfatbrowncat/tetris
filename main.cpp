@@ -7,10 +7,16 @@
 //  frontend (libtetrisfront). This file only wires UI events into the
 //  frontend.
 //
-//  Threading:
-//    - This (main/UI) thread pumps UI events only (never bgfx::renderFrame)
-//    - The frontend thread: bgfx::init + game loop (bgfx::frame) + bgfx::shutdown
-//    - bgfx owns its own internal render thread that drives bgfx::renderFrame
+//  Two frontend modes:
+//    - Threaded (macOS): a dedicated game thread owns bgfx (init/frame/
+//      shutdown); the UI thread pumps events and must never call
+//      bgfx::renderFrame(). The renderer presents to the window directly.
+//    - Callback (Linux, both X11 and Wayland): the UI layer is a GtkGLArea
+//      (the glsync design). The game runs on the UI thread inside the GL
+//      area's render callback — once per displayed frame, paced by the
+//      compositor's frame clock. bgfx (the OpenGL/EGL backend, single-
+//      threaded) renders the scene into a shared GL texture; the UI layer
+//      presents it as a full-frame quad. No CPU copy anywhere.
 //
 //  Controls:
 //    Arrow keys / A D : move left / right
@@ -42,23 +48,22 @@ static TetrisBackend::Key toBackendKey(int k) {
         case KEY_DROP:    return TetrisBackend::Key::HardDrop;
         case KEY_PAUSE:   return TetrisBackend::Key::Pause;
         case KEY_RESTART: return TetrisBackend::Key::Restart;
-    case KEY_QUIT:    return TetrisBackend::Key::Quit;
-    default:          return TetrisBackend::Key::None;
+        case KEY_QUIT:    return TetrisBackend::Key::Quit;
+        default:          return TetrisBackend::Key::None;
     }
 }
 
-// Offscreen (headless renderer, GTK): the UI layer presents the frames the
-// renderer publishes. Resizes are non-blocking — the drawing area immediately
-// covers the new size with the clear color + the last frame (pinned top-left),
-// so there is no visible strip while the renderer catches up. Windowed
-// backends (macOS) block until the frame is presented, keeping the canvas in
-// the same frame as the window resize.
-static bool s_offscreen = false;
-
 static void onFrameSync(uint32_t w, uint32_t h, void* user) {
     TetrisFrontend* fe = static_cast<TetrisFrontend*>(user);
-    if (s_offscreen) fe->setWindowSize(w, h);
-    else fe->repaintSynchronous(w, h);
+    fe->repaintSynchronous(w, h);
+}
+
+// The GL area's render callback driver (Linux): one game iteration with the
+// new pixel size; the scene lands in the shared texture, which the UI layer
+// presents as a full-frame quad right after this returns.
+static void onFrameDriver(uint32_t w, uint32_t h, double dt, void* user) {
+    TetrisFrontend* fe = static_cast<TetrisFrontend*>(user);
+    fe->frame(w, h, dt);
 }
 
 int main() {
@@ -69,48 +74,47 @@ int main() {
         return 1;
     }
 
-    s_offscreen = (window->offscreen != 0);
-
     TetrisFrontend frontend;
     uiSetFrameSyncCallback(&onFrameSync, &frontend);
-    std::thread gameThread(&TetrisFrontend::run, &frontend, window);
 
-    // Pump UI events until the frontend game loop has stopped. The actual
-    // rendering is driven by bgfx's own internal render thread — we must NOT
-    // call bgfx::renderFrame() here (see the notes above).
-    //
-    // Per-frame ordering:
-    //   1. uiPumpEvents  -> process events, update the allocation. Offscreen
-    //                        (GTK), the drawing-area paint also hands the new
-    //                        size to the game thread (non-blocking).
-    //   2. size handoff  -> offscreen: setWindowSize() (non-blocking — the
-    //                        drawing area covers the new size immediately with
-    //                        the clear color + last frame, no visible strip)
-    //                        + uiPresentFrame() (repaint with the latest
-    //                        published frame). Windowed (macOS):
-    //                        repaintSynchronous() (blocks until the frame is
-    //                        presented, so the canvas and the window land in the
-    //                        same frame).
-    //   3. uiCommitFrame -> windowed backends only.
-    while (!frontend.loopDone()) {
-        uiPumpEvents(0.016);
-        int k;
-        while ((k = uiPopKey()) != KEY_NONE)
-            frontend.pushKey(toBackendKey(k));
-        uint32_t pw, ph;
-        uiWindowSize(&pw, &ph);
-        if (s_offscreen) {
-            frontend.setWindowSize(pw, ph);
-            uiPresentFrame();
-        } else {
+    if (window->offscreen) {
+        // Linux GL area path: the game runs on this (UI) thread, driven from
+        // the GL area's render callback. bgfx is single-threaded and must be
+        // initialized on this thread before the first callback renders.
+        if (!frontend.init(window)) {
+            fprintf(stderr, "[tetris] renderer init failed\n");
+            uiShutdown();
+            return 1;
+        }
+        uiSetFrameDriver(&onFrameDriver, &frontend);
+        while (!frontend.loopDone()) {
+            uiPumpEvents(0.016);
+            int k;
+            while ((k = uiPopKey()) != KEY_NONE)
+                frontend.pushKey(toBackendKey(k));
+            if (uiShouldQuit()) frontend.requestStop();
+        }
+        frontend.shutdownNow();
+    } else {
+        // macOS: a dedicated game thread owns bgfx; the UI thread pumps
+        // events and resizes the canvas synchronously (canvas and window land
+        // in the same frame).
+        std::thread gameThread(&TetrisFrontend::run, &frontend, window);
+        while (!frontend.loopDone()) {
+            uiPumpEvents(0.016);
+            int k;
+            while ((k = uiPopKey()) != KEY_NONE)
+                frontend.pushKey(toBackendKey(k));
+            uint32_t pw, ph;
+            uiWindowSize(&pw, &ph);
             frontend.repaintSynchronous(pw, ph);
             uiCommitFrame();
+            if (uiShouldQuit()) frontend.requestStop();
         }
-        if (uiShouldQuit()) frontend.requestStop();
+        frontend.uiShutdownRequested();
+        gameThread.join();
     }
 
-    frontend.uiShutdownRequested();
-    gameThread.join();
     uiShutdown();
     return 0;
 }

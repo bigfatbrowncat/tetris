@@ -1,5 +1,5 @@
 # ============================================================================
-#  Tetris — cross-platform (bgfx; macOS Metal+Cocoa / Linux Vulkan+GTK4)
+#  Tetris — cross-platform (bgfx; macOS Metal+Cocoa / Linux OpenGL-EGL+GTK4)
 #  ---------------------------------------------------------------------------
 #  Modules:
 #    backend/   game logic, no UI / no OS          -> libtetrisback.a
@@ -23,9 +23,11 @@
 #    cmake --build build --target third-party-clean  # third-party artifacts
 #    cmake --build build --target distclean    # everything (app + third-party)
 #
-#  Threading contract (bgfx): the game thread owns bgfx (init/frame/shutdown);
-#  the UI thread (Cocoa or GTK) only pumps events and must never call
-#  bgfx::renderFrame().
+#  Threading contract (bgfx):
+#    macOS: the game thread owns bgfx (init/frame/shutdown); the UI thread
+#           only pumps events and must never call bgfx::renderFrame().
+#    Linux: the UI (GTK) thread owns bgfx — it runs single-threaded, driven
+#           from the GL area's render callback (compositor-paced).
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
@@ -70,9 +72,10 @@ if(APPLE)
 elseif(UNIX)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
-    pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
+    pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
+    pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
     set(UI_SOURCES gtk/window.cpp)
-    set(UI_LINK PkgConfig::GTK4 PkgConfig::WAYLAND_CLIENT)
+    set(UI_LINK PkgConfig::GTK4 PkgConfig::EPOXY PkgConfig::EGL)
 else()
     message(FATAL_ERROR "Unsupported platform (need macOS or Linux)")
 endif()
@@ -106,7 +109,8 @@ else()
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
         bgfxRelease bimgRelease bxRelease    # resolved via the link dir below
-        vulkan)                              # VK_KHR_wayland_surface mailbox detection
+        PkgConfig::EPOXY                     # the shared-context blit/flush (glFinish)
+        PkgConfig::EGL)                      # bgfx adopts the UI layer's EGL context
 endif()
 target_link_directories(tetrisfront PUBLIC ${TP_BIN})
 add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)

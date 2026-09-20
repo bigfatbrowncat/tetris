@@ -1,17 +1,19 @@
 // ============================================================================
 //  TetrisFrontend — the bgfx-based frontend.
 //  ---------------------------------------------------------------------------
-//  Owns the game loop: drives a TetrisBackend and a Renderer on a dedicated
-//  (API) thread. The UI thread (ui/ + macos/ or gtk/) pushes logical keys and
-//  window size and polls done(); the two communicate through lock-free-ish
-//  atomics and a small mutex-guarded key queue.
+//  Owns the game loop: drives a TetrisBackend and a Renderer. Two modes:
 //
-//  Threading (bgfx contract):
-//    - The thread that calls run() owns bgfx: init, per-frame
-//      render()+endFrame() (bgfx::frame), shutdown.
-//    - bgfx::renderFrame() must NEVER be called from the UI thread: because
-//      it is not invoked before bgfx::init(), bgfx spawns its own internal
-//      render thread that performs the GPU submit.
+//  Threaded (macOS): run() runs the loop on a dedicated (API) thread; the UI
+//  thread pushes logical keys and window size and polls done(). bgfx spawns
+//  its own internal render thread (bgfx::renderFrame is never called before
+//  bgfx::init).
+//
+//  Callback (Linux GTK GL area): the game runs on the UI thread, driven from
+//  the GL area's render callback (paced by the compositor's frame clock).
+//  init() prepares bgfx single-threaded (bgfx::renderFrame is latched before
+//  bgfx::init, on the UI thread), frame() runs one update+render iteration
+//  inside the callback, and shutdownNow() tears everything down. The two
+//  communicate through atomics and a small mutex-guarded key queue.
 // ============================================================================
 #pragma once
 
@@ -36,23 +38,31 @@ public:
     TetrisFrontend(const TetrisFrontend&) = delete;
     TetrisFrontend& operator=(const TetrisFrontend&) = delete;
 
+    // --- threaded mode (macOS) ---------------------------------------------
     // Run the game loop on the calling thread.
     // win: native window data from the UI layer (handle + bgfx platform type).
     void run(const UiWindow* win);
 
+    // --- callback mode (Linux GTK GL area) ---------------------------------
+    // Initialize the renderer on the calling (UI) thread. Must be called
+    // before frame(); bgfx is then driven single-threaded from that thread.
+    bool init(const UiWindow* win);
+    // One game iteration: update + render + endFrame. Called from the GL
+    // area's render callback (the UI thread) with the new pixel size.
+    void frame(uint32_t pixelW, uint32_t pixelH, double dt);
+    // Tear down on the UI thread (after the last frame()).
+    void shutdownNow();
+
     // --- thread-safe UI-side API --------------------------------------------
     void pushKey(TetrisBackend::Key k);
-    // Update the target pixel size (non-blocking). If it changed, the game
-    // thread is woken so it resets bgfx + renders the new size on its next
-    // iteration. This is the resize path on Wayland, where the content is a
-    // subsurface that commits independently of the root (see main.cpp).
+    // Update the target pixel size (non-blocking, threaded mode). If it
+    // changed, the game thread is woken so it resets bgfx + renders the new
+    // size on its next iteration.
     void setWindowSize(uint32_t pixelW, uint32_t pixelH);
     // Force the game thread to reset bgfx to (pixelW, pixelH) and submit one
-    // frame, blocking the caller until that frame has actually been presented.
-    // Used by the backends where the canvas must land in the same frame as the
-    // window resize (X11, macOS): the UI layer calls this DURING a window
-    // resize so the GL canvas resizes in the same frame as the window — no
-    // stray line while the old, smaller buffer is still on screen.
+    // frame, blocking the caller until that frame has actually been presented
+    // (threaded mode: the canvas must land in the same frame as the window
+    // resize).
     void repaintSynchronous(uint32_t pixelW, uint32_t pixelH);
     void requestStop();
     bool done() const;
@@ -60,8 +70,15 @@ public:
     void uiShutdownRequested();
 
 private:
+    // Shared by both modes: renderer init + env hooks (smoke test /
+    // screenshot frame). Returns false when the renderer cannot start.
+    bool start(const UiWindow* win);
+    // One game iteration (input, update, render, endFrame, hooks).
+    void doFrame(uint32_t pixelW, uint32_t pixelH, double dt);
+
     TetrisBackend m_backend;
     std::unique_ptr<Renderer> m_renderer;
+    bool m_initDone = false;
 
     std::mutex m_keysMutex;
     std::deque<TetrisBackend::Key> m_keys;
@@ -91,6 +108,12 @@ private:
     // Set by repaintSynchronous(); consumed by the game loop, which skips the
     // gravity update for that frame (freezes the game while the canvas resizes).
     std::atomic<bool> m_syncResize{false};
+
+    // Frame hooks (TETRIS_SMOKE_TEST / TETRIS_SCREENSHOT), set in start().
+    int m_smokeFrames = 0;
+    int m_shotFrame = 0;
+    const char* m_shotPath = "tetris_shot.bmp";
+    int m_frameNo = 0;
 };
 
 }  // namespace tetris
