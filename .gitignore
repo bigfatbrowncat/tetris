@@ -1,3 +1,5 @@
 /build
 /tetris_high.txt
 /tetris_shot.bmp
+.DS_Store
+.idea

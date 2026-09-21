@@ -393,7 +393,6 @@ public:
     }
 
     void requestScreenShot(const char* path) {
-        fprintf(stderr, "[dbg] requestScreenShot(%s) ok=%d glarea=%d\n", path, (int)ok, (int)m_glarea);
         if (!ok) return;
 #if !BX_PLATFORM_OSX
         if (m_glarea) {
