@@ -354,7 +354,12 @@ public:
         }
 
         bgfx::setTexture(0, uTex, atlas);
-        bgfx::setVertexBuffer(0, vbuf);
+        // Draw exactly the vertices we uploaded this frame. Without the count,
+        // setVertexBuffer draws the whole dynamic buffer (8192 verts), so any
+        // stale tail left by a smaller/larger previous upload (or garbage
+        // latched during a fast resize) is re-rendered over the scene every
+        // frame — the static cyan/blue bands seen after resizing.
+        bgfx::setVertexBuffer(0, vbuf, 0, (uint32_t)verts.size());
         // Blending composites the text glyphs (straight alpha from the atlas)
         // over the scene; opaque geometry (a=1) is unaffected.
         bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_BLEND_ALPHA);

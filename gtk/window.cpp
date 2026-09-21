@@ -492,6 +492,33 @@ static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) 
         glBindVertexArray(0);
     }
 
+    if (getenv("TETRIS_EGL_DEBUG")) {
+        static bool loggedOnce = false;
+        if (!loggedOnce) {
+            loggedOnce = true;
+            const char* exts = eglQueryString(s_gl.display, EGL_EXTENSIONS);
+            fprintf(stderr, "[dbg] EGL_MESA_image_dma_buf_export: %s\n",
+                    exts && strstr(exts, "EGL_MESA_image_dma_buf_export") != nullptr
+                        ? "YES (GtkGLArea presents via the dmabuf path)"
+                        : "no (GL texture download path)");
+            const char* r = (const char*)glGetString(GL_RENDERER);
+            fprintf(stderr, "[dbg] C1 renderer: %s\n", r ? r : "(null)");
+        }
+        // fboTex is the texture id GTK attached to the area FBO — exactly the
+        // image GSK will present this frame. If it ping-pongs between two ids
+        // while the blit lands elsewhere, that is the glitch.
+        GLint fbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+        GLuint fboTex = 0;
+        if (fbo != 0)
+            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                  GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                                  (GLint*)&fboTex);
+        fprintf(stderr, "[dbg] frame w=%u h=%u fbo=%d fboTex=%u sceneTex=%u texW=%u texH=%u glerr=0x%x\n",
+                w, h, (int)fbo, (unsigned)fboTex, (unsigned)s_gl.sceneTex,
+                s_gl.texW, s_gl.texH, (unsigned)glGetError());
+    }
+
     return TRUE;  // we handled the draw
 }
 
