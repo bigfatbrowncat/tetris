@@ -306,6 +306,20 @@ public:
 
     bool render(const TetrisBackend::Snapshot& s, uint32_t pw, uint32_t ph) {
         if (!ok || pw == 0 || ph == 0) return false;
+#if BX_PLATFORM_OSX
+        // The Metal back buffer is only resized via bgfx::reset(); without it
+        // the drawable stays at the init size (640x640) for the whole run,
+        // while the projection below is computed for the real window size —
+        // Core Animation then stretches the small buffer to fill the window
+        // and the scene appears zoomed in / cropped. Resize the drawable
+        // whenever the window size changes (the game thread is the bgfx API
+        // thread, so this is a plain once-per-frame API call).
+        if (pw != lastW || ph != lastH) {
+            bgfx::reset(pw, ph, m_resetFlags);
+            lastW = pw;
+            lastH = ph;
+        }
+#endif
 #if !BX_PLATFORM_OSX
         if (m_glarea) {
             // Make the shared context current: the resize path below does raw
