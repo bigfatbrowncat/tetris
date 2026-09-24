@@ -1,4 +1,5 @@
-// Renderer implementation (bgfx; Metal on macOS, OpenGL/EGL on Linux).
+// Renderer implementation (bgfx; Metal on macOS, OpenGL/EGL on Linux,
+// Direct3D 11 on Windows).
 #include "renderer.h"
 
 #include "font.h"
@@ -8,7 +9,7 @@
 #include <bgfx/bgfx.h>
 #include <bx/platform.h>
 
-#if !BX_PLATFORM_OSX
+#if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
 // Epoxy first: it defines __khrplatform_h_ itself, which suppresses the
 // duplicate khronos enum in the real KHR/khrplatform.h pulled in by EGL.
 #include <epoxy/gl.h>
@@ -181,7 +182,7 @@ public:
     bool ok = false;
     const bgfx::Caps* caps = nullptr;
 
-#if !BX_PLATFORM_OSX
+#if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
     // Linux GL area path: single-threaded bgfx on the UI thread, rendering the
     // scene into the UI layer's shared scene texture (sceneTex) through the
     // UI layer's pbuffer context (bgfx adopts it via Init.platformData.context).
@@ -193,6 +194,15 @@ public:
     GLuint m_sceneTex = 0;
     bgfx::TextureHandle sceneRT = BGFX_INVALID_HANDLE;   // bgfx handle over sceneTex
     bgfx::FrameBufferHandle sceneFB = BGFX_INVALID_HANDLE;
+#elif BX_PLATFORM_WINDOWS
+    // Windows composition path: the UI layer's ID3D11Device* (adopted via
+    // Init.platformData.context) and the HWND — kept to re-issue
+    // bgfx::setPlatformData with the *same* context/ndt when the back-buffer
+    // RTV is re-created on a resize (setPlatformData requires them unchanged
+    // and re-reads only the backBuffer).
+    void*    m_d3dDevice = nullptr;
+    void*    m_nwh = nullptr;
+    uint32_t m_nwhType = UI_NWH_DEFAULT;
 #endif
 
     bool init(const UiWindow* win) {
@@ -207,6 +217,43 @@ public:
         init.resolution.width = 640;
         init.resolution.height = 640;
         init.resolution.reset = m_resetFlags;
+#elif BX_PLATFORM_WINDOWS
+        // Windows composition path: the UI layer owns the D3D11 device, the
+        // composition swap chain and a full-window scene texture (created in
+        // uiCreateWindow). bgfx adopts the device (platformData.context — it
+        // AddRefs it) and renders into the scene texture (platformData.
+        // backBuffer = its RTV — bgfx borrows the pointer and never releases
+        // it); the UI layer blits the scene texture to the swap chain's back
+        // buffer and presents it through DirectComposition.
+        if (win->offscreen == 0 || win->context == nullptr || win->backBuffer == nullptr) {
+            fprintf(stderr, "[tetris] Windows windowed (non-composition) mode is not supported\n");
+            return false;
+        }
+        m_d3dDevice = win->context;
+        m_nwh = win->nwh;
+        m_nwhType = win->nwhType;
+
+        // Single-threaded bgfx: latching bgfx::renderFrame() from this thread
+        // (the UI thread that will drive bgfx::frame() from uiPumpEvents)
+        // keeps bgfx from spawning its own render thread, so bgfx::frame()
+        // performs the GPU submit inline on the caller — every D3D11 call
+        // (bgfx's render + the UI layer's ResizeBuffers/Present) runs on one
+        // thread (the POC's single-threaded discipline).
+        bgfx::renderFrame();
+
+        init.type = bgfx::RendererType::Direct3D11;
+        init.fallback = false;
+        init.platformData.context = win->context;
+        init.platformData.backBuffer = win->backBuffer;
+        init.platformData.backBufferDS = nullptr;  // bgfx creates/owns its depth texture
+        init.platformData.nwh = win->nwh;          // HWND (unused in this mode; for debugging)
+        init.platformData.ndt = nullptr;
+        init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
+        uint32_t w = 0, h = 0;
+        uiWindowSize(&w, &h);
+        init.resolution.width = w != 0 ? w : 640;
+        init.resolution.height = h != 0 ? h : 640;
+        init.resolution.reset = 0;  // flip() never presents in this mode; vsync is the UI layer's Present
 #else
         m_glarea = (win->offscreen != 0);
         if (!m_glarea) {
@@ -288,7 +335,7 @@ public:
 
     void shutdown() {
         if (!ok) return;
-#if !BX_PLATFORM_OSX
+#if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
         if (m_glarea) {
             // The scene texture storage is sceneTex (shared; bgfx never
             // deletes it); only the bgfx handles go away here.
@@ -319,8 +366,30 @@ public:
             lastW = pw;
             lastH = ph;
         }
-#endif
-#if !BX_PLATFORM_OSX
+#elif BX_PLATFORM_WINDOWS
+        // The default frame buffer is the UI layer's full-window scene
+        // texture (the RTV passed as platformData.backBuffer); the UI layer
+        // resizes the swap chain and (re)creates the scene texture whenever
+        // the window size changes. Re-point bgfx at the (re)created RTV:
+        // setPlatformData() marks the platform data dirty so the next reset
+        // re-reads the backBuffer, and the reset moves bgfx's depth texture
+        // to the new size. (Runs on the UI thread — single-threaded bgfx.)
+        if (pw != lastW || ph != lastH) {
+            void* rtv = uiWindowResize(pw, ph);
+            if (rtv == nullptr) return false;
+            bgfx::PlatformData pd;
+            pd.context = m_d3dDevice;   // unchanged (setPlatformData requires it)
+            pd.backBuffer = rtv;        // the (new) back-buffer RTV
+            pd.backBufferDS = nullptr;  // bgfx owns its depth texture
+            pd.nwh = m_nwh;
+            pd.ndt = nullptr;
+            pd.type = (bgfx::NativeWindowHandleType::Enum)m_nwhType;
+            bgfx::setPlatformData(pd);
+            bgfx::reset(pw, ph, 0);
+            lastW = pw;
+            lastH = ph;
+        }
+#else
         if (m_glarea) {
             // Make the shared context current: the resize path below does raw
             // GL work (overrideInternal) and bgfx's submit expects it too.
@@ -355,7 +424,7 @@ public:
         computeOrtho(proj, pw, ph);
         bgfx::setViewTransform(0, view, proj);
         bgfx::setViewRect(0, 0, 0, (uint16_t)pw, (uint16_t)ph);
-#if !BX_PLATFORM_OSX
+#if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
         if (m_glarea) {
             // Render the scene into the shared texture. No depth attachment,
             // so clear color only (the scene is 2D and never uses depth).
@@ -384,7 +453,7 @@ public:
     void endFrame() {
         if (!ok) return;
         bgfx::frame();
-#if !BX_PLATFORM_OSX
+#if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
         if (m_glarea) {
             // bgfx::frame() (single-threaded) just issued the scene render
             // into sceneTex on the shared context's stream. Flush it —
@@ -399,7 +468,9 @@ public:
 
     void syncPresent() {
         if (!ok) return;
-#if !BX_PLATFORM_OSX
+#if BX_PLATFORM_WINDOWS
+        return;  // the UI layer's resize present (DO_NOT_SEQUENCE) is the sync
+#elif !BX_PLATFORM_OSX
         if (m_glarea) return;  // the UI layer's blit is the present
 #endif
         bgfx::frame();
@@ -408,7 +479,22 @@ public:
 
     void requestScreenShot(const char* path) {
         if (!ok) return;
-#if !BX_PLATFORM_OSX
+#if BX_PLATFORM_WINDOWS
+        // bgfx::requestScreenShot cannot work in external-back-buffer mode
+        // (its D3D11 capture path expects its own swap chain); read the
+        // full-window scene texture back through the UI layer instead — the
+        // frame bgfx just rendered (the blit copies it 1:1 to the back
+        // buffer, so it is exactly the frame about to be presented). The
+        // texture is R8G8B8A8 — RGBA bytes, not BGRA.
+        if (lastW > 0 && lastH > 0) {
+            std::vector<uint8_t> px((size_t)lastW * lastH * 4);
+            const int n = uiWindowReadBackbuffer(lastW, lastH, px.data(), (uint32_t)px.size());
+            if (n > 0)
+                writeBmp(path, lastW, lastH, (uint32_t)(lastW * 4), px.data(),
+                         /*yflip=*/false, /*isBgra=*/false);
+        }
+        return;
+#elif !BX_PLATFORM_OSX
         if (m_glarea) {
             // bgfx::requestScreenShot only works on *window* frame buffers;
             // sceneFB is a texture FBO. Read the shared scene texture back

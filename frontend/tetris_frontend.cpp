@@ -114,8 +114,6 @@ void TetrisFrontend::doFrame(uint32_t pixelW, uint32_t pixelH, double dt) {
     m_repaintCv.notify_all();
     ++m_frameNo;
 
-    if (m_frameNo <= m_shotFrame + 1 && m_shotFrame > 0)
-        fprintf(stderr, "[dbg] frame %d shot %d\n", m_frameNo, m_shotFrame);
     if (m_shotFrame > 0 && m_frameNo == m_shotFrame)
         m_renderer->requestScreenShot(m_shotPath);
 

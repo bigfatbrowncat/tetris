@@ -171,6 +171,17 @@ void uiSetFrameDriver(UiFrameDriver cb, void* userData) {
     (void)cb; (void)userData;
 }
 
+// Windows composition path only; never called on macOS.
+void* uiWindowResize(uint32_t w, uint32_t h) {
+    (void)w; (void)h;
+    return nullptr;
+}
+
+int uiWindowReadBackbuffer(uint32_t w, uint32_t h, void* out, uint32_t outSize) {
+    (void)w; (void)h; (void)out; (void)outSize;
+    return -1;
+}
+
 void uiShutdown(void) {
     if (s_app) [s_app terminate:nil];
 }

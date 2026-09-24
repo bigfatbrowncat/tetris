@@ -6,10 +6,12 @@ Usage: build_shaders.py <out-dir> [shaderc-bin] [bgfx-root]
 Writes ONLY to <out-dir> (a directory inside the CMake build tree):
   <out-dir>/vs_quad.h   <out-dir>/fs_quad.h
 
-macOS  -> Metal shaders
-Linux  -> GLSL 4.30 text (profile "430") — bgfx's OpenGL/EGL backend
-           compiles the embedded GLSL; it needs a desktop GLSL source, not
-           SPIR-V.
+macOS   -> Metal shaders
+Linux   -> GLSL 4.30 text (profile "430") — bgfx's OpenGL/EGL backend
+            compiles the embedded GLSL; it needs a desktop GLSL source, not
+            SPIR-V.
+Windows -> HLSL 5.0 (profile "s_5_0") — bgfx's Direct3D11 backend compiles
+            the embedded DXBC; it needs a shaderc --platform windows build.
 """
 import os
 import subprocess
@@ -19,13 +21,21 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 IS_MACOS = sys.platform == "darwin"
-PLATFORM = "osx" if IS_MACOS else "linux"
-PROFILE = "metal" if IS_MACOS else "430"
+IS_WINDOWS = sys.platform == "win32"
+if IS_MACOS:
+    PLATFORM, PROFILE = "osx", "metal"
+elif IS_WINDOWS:
+    PLATFORM, PROFILE = "windows", "s_5_0"
+else:
+    PLATFORM, PROFILE = "linux", "430"
 
 # Defaults for running the script standalone (no CMake).
 DEFAULT_SHADERC = os.path.join(
     ROOT, "third-party/bgfx/.build",
-    "osx-arm64" if IS_MACOS else "linux64_gcc", "bin", "shadercRelease")
+    ("osx-arm64" if IS_MACOS
+     else "win64_vs2022" if IS_WINDOWS
+     else "linux64_gcc"),
+    "bin", "shadercRelease" + (".exe" if IS_WINDOWS else ""))
 DEFAULT_BGFX = os.path.join(ROOT, "third-party/bgfx")
 
 

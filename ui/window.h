@@ -1,7 +1,8 @@
 // Platform-neutral window + keyboard input layer for the bgfx Tetris port.
 // Exposes a small C API so the C++ game (main.cpp) stays free of
-// Objective-C++ / GTK details. Implemented by macos/window.mm (Cocoa) and
-// gtk/window.cpp (GTK4, X11 + Wayland).
+// Objective-C++ / GTK / Win32+D3D11 details. Implemented by
+// macos/window.mm (Cocoa), gtk/window.cpp (GTK4, X11 + Wayland) and
+// windows/window.cpp (Win32 + DirectComposition + D3D11).
 #pragma once
 #include <stdint.h>
 
@@ -27,10 +28,13 @@ typedef struct {
 	uint32_t nwhType;   // UI_NWH_*
 	void*    nwh;
 	void*    ndt;      // native display: X11 Display* / Wayland wl_display* (or NULL)
-	// 1: the renderer renders offscreen into a shared GL texture that the UI
-	//    layer presents as a full-frame quad inside a GtkGLArea (the GTK GL
-	//    area path, X11 + Wayland — GPU to GPU, no CPU copy). nwh/ndt are
-	//    unused. 0: the renderer presents to nwh directly (macOS).
+	// 1: the renderer renders offscreen: on Linux (the GTK GL area path,
+	//    X11 + Wayland) into a shared GL texture that the UI layer presents
+	//    as a full-frame quad (GPU to GPU, no CPU copy, nwh/ndt unused); on
+	//    Windows into the UI layer's full-window D3D11 scene texture
+	//    (context/backBuffer below), which the UI layer blits to the
+	//    composition swap chain's back buffer and presents through
+	//    DirectComposition. 0: the renderer presents to nwh directly (macOS).
 	uint32_t offscreen;
 	// GTK GL area path only (offscreen == 1); all values are EGL types:
 	//   eglDisplay      — the EGLDisplay everything shares.
@@ -53,6 +57,21 @@ typedef struct {
 	void*    eglPbuffer;
 	void*    eglAreaSurface;
 	uint32_t sceneTex;
+	// Windows composition path only (offscreen == 1); all D3D11 types:
+	//   context    — the ID3D11Device* bgfx adopts (platformData.context);
+	//                bgfx AddRefs it, the UI layer owns the base reference.
+	//   backBuffer — the ID3D11RenderTargetView* over the UI layer's
+	//                full-window scene texture (platformData.backBuffer) —
+	//                the surface bgfx renders the game into. bgfx never
+	//                releases it; the UI layer re-creates it on resize
+	//                (uiWindowResize) and re-points bgfx at it with
+	//                bgfx::setPlatformData() + bgfx::reset(). The UI layer
+	//                then blits the scene texture to the swap chain's back
+	//                buffer and presents (the swap chain itself is fully
+	//                owned by the UI layer).
+	// NULL on other platforms.
+	void*    context;
+	void*    backBuffer;
 } UiWindow;
 
 // Create the UI toolkit (app + menu). Call once on the main thread.
@@ -89,16 +108,33 @@ void uiCommitFrame(void);
 typedef void (*UiFrameSyncCallback)(uint32_t pixelW, uint32_t pixelH, void* userData);
 void uiSetFrameSyncCallback(UiFrameSyncCallback cb, void* userData);
 
-// GTK GL area path only: the game driver. The UI layer calls
-// cb(devicePixelW, devicePixelH, dtSeconds, userData) from the GtkGLArea
-// "render" callback — once per displayed frame, paced by the compositor's
-// frame clock — with the GL area's context current. cb() updates the game and
-// renders the scene into UiWindow.sceneTex (single-threaded bgfx driven on
-// this thread: bgfx::frame() followed by glFinish() so the texture write is
-// complete on return). The UI layer then presents sceneTex as a full-frame
-// quad into the window. Never called on other platforms.
+// Game driver (the callback-mode UI paths: the GTK GL area, and the Windows
+// composition window). The UI layer calls cb(pixelW, pixelH, dtSeconds,
+// userData) once per displayed frame, on the UI thread — from the GtkGLArea
+// "render" callback (paced by the compositor's frame clock) or from
+// uiPumpEvents / the resize handler (paced by the vsync present) — with the
+// UI layer's rendering context current. cb() updates the game and renders
+// the scene (single-threaded bgfx driven on this thread: bgfx::frame() does
+// the GPU submit inline on the caller); the UI layer then presents (the GL
+// area blit, or the composition swap chain's Present). Never called on other
+// platforms.
 typedef void (*UiFrameDriver)(uint32_t pixelW, uint32_t pixelH, double dt, void* userData);
 void uiSetFrameDriver(UiFrameDriver cb, void* userData);
+
+// Windows composition path only: resize the composition swap chain to
+// (w, h) and (re)create the UI layer's full-window scene texture (bgfx's
+// render target + the blit's source); returns the (new) scene RTV for
+// bgfx::setPlatformData(), or NULL on failure. Called by the renderer on a
+// size change, on the UI thread. No-op on other platforms (returns NULL).
+void* uiWindowResize(uint32_t w, uint32_t h);
+
+// Windows composition path only: read the full-window scene texture (the
+// frame bgfx just rendered; the blit copies it 1:1 to the swap chain's back
+// buffer, so it is exactly the frame about to be presented) back into `out`
+// as RGBA rows, top to bottom (w*h*4 bytes at most). Returns the number of
+// bytes written, or -1 on error / on other platforms
+// (bgfx::requestScreenShot is used there).
+int uiWindowReadBackbuffer(uint32_t w, uint32_t h, void* out, uint32_t outSize);
 
 void uiShutdown(void);
 

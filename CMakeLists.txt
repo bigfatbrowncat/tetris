@@ -1,5 +1,9 @@
 # ============================================================================
-#  Tetris — cross-platform (bgfx; macOS Metal+Cocoa / Linux OpenGL-EGL+GTK4)
+#  Tetris — cross-platform (bgfx)
+#    macOS  : Metal + Cocoa
+#    Linux  : OpenGL/EGL + GTK4
+#    Windows: Direct3D 11 + DirectComposition (a never-flickering resizable
+#             window, ported from the noflicker_directx_window POC)
 #  ---------------------------------------------------------------------------
 #  Modules:
 #    backend/   game logic, no UI / no OS          -> libtetrisback.a
@@ -7,16 +11,22 @@
 #    ui/        platform-neutral window/input C API (window.h)
 #    macos/     Cocoa window + input (OS-specific) -> macOS UI module
 #    gtk/       GTK4 window + input (OS-specific)  -> Linux UI module
+#    windows/   Win32+DComp+D3D11 (OS-specific)    -> Windows UI module
 #    third-party/  bgfx / bx / bimg build targets  (see its CMakeLists.txt)
 #
 #  Build:
 #    cmake -S . -B build
-#    cmake --build build            # ./build/tetris
+#    cmake --build build            # ./build/tetris(.exe)
+#    (multi-config generators, e.g. Visual Studio: --build build --config Release)
 #    cmake --build build --target shaders   # regenerate embedded shader headers
 #
 #  All generated files (the executable, the embedded shader headers) are
 #  written only inside the build directory; the build never touches the
 #  source tree.
+#
+#  Windows toolchain: the pinned bx requires MSVC >= 19.35 (VS 2022 17.5+);
+#  configure with a VS 2022 (Build Tools) compiler, e.g.
+#    cmake -G "Visual Studio 17 2022" -A x64 -S . -B build
 #
 #  Clean:
 #    cmake --build build --target clean        # app artifacts only
@@ -28,6 +38,9 @@
 #           only pumps events and must never call bgfx::renderFrame().
 #    Linux: the UI (GTK) thread owns bgfx — it runs single-threaded, driven
 #           from the GL area's render callback (compositor-paced).
+#    Windows: the UI (Win32) thread owns bgfx — single-threaded, driven from
+#           the message pump once per displayed frame (vsync-paced), exactly
+#           like the Linux path; the POC's single-threaded D3D discipline.
 # ============================================================================
 cmake_minimum_required(VERSION 3.20)
 
@@ -40,6 +53,13 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)  # bx headers require C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(MSVC)
+    # bx's platform.h requires the true __cplusplus value (MSVC reports the
+    # 199711L legacy value otherwise) and the conforming preprocessor; the
+    # bgfx vcxproj carries both flags.
+    add_compile_options(/Zc:__cplusplus /Zc:preprocessor)
+endif()
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -69,15 +89,25 @@ if(APPLE)
         "-framework CoreVideo"
         "-framework CoreMedia"
         "-framework VideoToolbox")
-elseif(UNIX)
+elseif(WIN32)
+    set(UI_SOURCES windows/window.cpp)
+    # d3d11/dxgi: the UI layer's device + composition swap chain (bgfx loads
+    # them dynamically, so no import libs are needed for bgfx itself);
+    # dcomp: the DirectComposition binding; d3dcompiler: the blit shader
+    # (D3DCompile2, the POC compiles the full-screen image HLSL at runtime);
+    # user32: the window + message pump.
+    set(UI_LINK d3d11 dxgi dcomp d3dcompiler user32)
+    # The bgfx/bx/bimg static libraries are built with the static CRT
+    # (/MT in Release, /MTd in Debug); the app must match or the link fails
+    # with LNK2038 (RuntimeLibrary mismatch).
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+else()
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
     pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
     pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
     set(UI_SOURCES gtk/window.cpp)
     set(UI_LINK PkgConfig::GTK4 PkgConfig::EPOXY PkgConfig::EGL)
-else()
-    message(FATAL_ERROR "Unsupported platform (need macOS or Linux)")
 endif()
 set(PLATFORM_SHADERS_INC ${GEN_SHADERS})
 
@@ -105,6 +135,12 @@ if(APPLE)
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
         bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
+elseif(WIN32)
+    # No extra libs: the frontend only talks to bgfx (and to the UI layer's
+    # C API); the D3D11/DComp import libs belong to the UI module (the exe).
+    target_link_libraries(tetrisfront PUBLIC
+        tetrisback
+        bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
 else()
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
@@ -124,10 +160,14 @@ set(GEN_SHADER_HDRS
     ${GEN_SHADERS}/shaders/vs_quad.h
     ${GEN_SHADERS}/shaders/fs_quad.h)
 
+# Python 3 (build_shaders.py). `python3` on PATH on Linux/macOS;
+# `python` on Windows — find_package(Python3) resolves either.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
 add_custom_command(
     OUTPUT ${GEN_SHADER_HDRS}
-    COMMAND python3 ${CMAKE_SOURCE_DIR}/scripts/build_shaders.py
-            ${GEN_SHADERS}/shaders ${TP_BIN}/shadercRelease ${BGFX_ROOT}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/build_shaders.py
+            ${GEN_SHADERS}/shaders ${TP_BIN}/shadercRelease${CMAKE_EXECUTABLE_SUFFIX} ${BGFX_ROOT}
     DEPENDS ${CMAKE_SOURCE_DIR}/shaders/vs_quad.sc
             ${CMAKE_SOURCE_DIR}/shaders/fs_quad.sc
             tp_shaderc
