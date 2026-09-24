@@ -15,14 +15,23 @@
 //  full-screen quad — the POC's DrawTriangle, "one texture scaled to the
 //  full frame" (per-frame RTV over GetBuffer(0), clear, draw, release after
 //  the present). The swap chain is 100% owned by this layer, so the POC's
-//  exact present sequence is preserved:
-//    normal frame — Present(1, DXGI_PRESENT_DO_NOT_SEQUENCE): the POC's own
-//                   blocking present — it blocks until the frame has actually
-//                   scanned out, which paces the frame loop (one frame per
-//                   vsync) and, by the time the next WM_NCCALCSIZE runs (same
-//                   thread), guarantees no in-flight flip — the POC's
-//                   never-flicker ResizeBuffers precondition, satisfied by
-//                   construction;
+//  exact resize present sequence is preserved, surrounded by two presents
+//  per frame cycle so that NO flip is ever in flight when the buffers are
+//  resized (the POC's never-flicker precondition):
+//    normal frame — Present(1, 0): a vsync-paced flip that UPDATES the
+//                   displayed content (the game animates between resizes).
+//                   It leaves at most one flip in flight;
+//    resize — before ResizeBuffers, a "drain" present: the current scene
+//                   (the last rendered frame — re-blitting it, so no
+//                   regression to an older frame) is presented with the
+//                   POC's own pair: the Intel output's vblank waited first
+//                   (POC), then Present(0, DXGI_PRESENT_RESTART) — which
+//                   DISCARDS the in-flight flip of the previous Normal
+//                   present — then a blocking
+//                   Present(1, DXGI_PRESENT_DO_NOT_SEQUENCE): when the
+//                   buffers are resized, no present is outstanding (an
+//                   in-flight flip left across ResizeBuffers can land as a
+//                   glitch frame — flicker);
 //    resize (WM_NCCALCSIZE), before returning —
 //                   Present(0, DXGI_PRESENT_RESTART) (discard outstanding
 //                   queued presents, queue the new-size frame ASAP) +
@@ -35,10 +44,10 @@
 //  what you see is the composition swap chain (FLIP_SEQUENTIAL, 2 back
 //  buffers, B8G8R8A8, AlphaMode IGNORE) bound to the window through a
 //  composition target/visual, created between the window's construction and
-//  its ShowWindow (as in the POC). On resize: the pipeline state is cleared,
+//  its ShowWindow (as in the POC). On resize: the drain present (above) has
+//  fully displayed the in-flight flip, the pipeline state is cleared,
 //  ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_
-//  GDI_COMPATIBLE) (safe — the previous frame's DO_NOT_SEQUENCE present has
-//  already completed, so no flip is in flight and no back-buffer ref is
+//  GDI_COMPATIBLE) (safe — no flip is in flight and no back-buffer ref is
 //  live), the scene texture is (re)created,
 //  one frame at the new size is rendered + blitted, and the two presents
 //  land the window frame and its content in the same compositor update.
@@ -551,24 +560,42 @@ bool createD3D(uint32_t w, uint32_t h) {
     return createSceneTexture(w, h);
 }
 
+// The three present sequences this layer uses (see the file header).
+enum class PresentMode {
+    // Present(1, 0): a vsync-paced flip that updates the displayed content.
+    Normal,
+    // The POC's resize pair: syncIntelOutput(), Present(0, RESTART) (discard
+    // outstanding queued presents, queue a frame ASAP), release the
+    // back-buffer refs, Present(1, DO_NOT_SEQUENCE) (block until the frame
+    // has actually scanned out).
+    Resize,
+    // Run just before a resize's ResizeBuffers: the current scene (the last
+    // rendered frame — re-blitting it, so no regression) is presented with
+    // the SAME POC pair as Resize: the RESTART discards the in-flight flip
+    // of the previous Normal present (a lone DO_NOT_SEQUENCE does not
+    // discard it — the flip could then survive ResizeBuffers and land as a
+    // glitch frame), and the blocking DO_NOT_SEQUENCE leaves no present
+    // outstanding when the buffers are resized.
+    Drain,
+};
+
 // Blit the scene texture to the swap chain's back buffer — the POC's
 // DrawTriangle (a full-screen quad sampling the texture, "one texture scaled
-// to the full frame") plus this layer's present:
-//   normal frame — Present(1, DXGI_PRESENT_DO_NOT_SEQUENCE): the POC's own
-//   blocking present — it blocks until the frame has actually scanned out.
-//   This paces the frame loop (one frame per vsync) and, crucially,
-//   guarantees that by the time WM_NCCALCSIZE runs (same thread) the
-//   previous frame's present is fully done — no in-flight flip, the POC's
-//   precondition for a flicker-free ResizeBuffers, satisfied by
-//   construction (exactly how the POC's per-resize DO_NOT_SEQUENCE gives it
-//   the precondition);
-//   resize frame — the POC's resize present sequence: syncIntelOutput(),
-//   then Present(0, DXGI_PRESENT_RESTART) (discard outstanding queued
-//   presents and queue the new-size frame ASAP), release the back-buffer
-//   refs, then Present(1, DXGI_PRESENT_DO_NOT_SEQUENCE) (block until the
-//   new-size frame has actually scanned out, so the window frame and its
-//   content land in the same compositor update).
-bool blitToSwapChain(bool resizeFrame) {
+// to the full frame") plus this layer's present (see PresentMode):
+//   Normal — Present(1, 0): vsync-paced and — unlike a lone
+//   DO_NOT_SEQUENCE on this composition swap chain — it actually UPDATES the
+//   displayed content, so the game animates between resizes;
+//   Resize — the POC's resize present sequence: syncIntelOutput(), then
+//   Present(0, DXGI_PRESENT_RESTART) (discard outstanding queued presents
+//   and queue the new-size frame ASAP), release the back-buffer refs, then
+//   Present(1, DXGI_PRESENT_DO_NOT_SEQUENCE) (block until the new-size frame
+//   has actually scanned out, so the window frame and its content land in
+//   the same compositor update);
+//   Drain — the POC pair applied to the just-blitted current scene (see
+//   PresentMode::Drain): it discards the in-flight flip of the previous
+//   Normal present and leaves no present outstanding when the caller
+//   resizes the buffers (the POC's never-flicker precondition).
+bool blitToSwapChain(PresentMode mode) {
     if (g.d3dDead || g.swapChain == nullptr || g.dctx == nullptr ||
         g.device == nullptr || g.sceneSrv == nullptr) {
         return false;
@@ -610,17 +637,22 @@ bool blitToSwapChain(bool resizeFrame) {
     g.dctx->OMSetRenderTargets(1, &rtv, nullptr);  // POC: no depth for the blit
     g.dctx->Draw(6, 0);
 
-    if (resizeFrame) {
-        // POC: sync with the Intel output, then discard outstanding queued
-        // presents and queue a frame with the new size ASAP.
-        syncIntelOutput();
-        if (!checkPresentHr("Present(RESTART)", g.swapChain->Present(0, DXGI_PRESENT_RESTART))) {
+    if (mode == PresentMode::Normal) {
+        if (!checkPresentHr("Present", g.swapChain->Present(1, 0))) {
             bb->Release();
             rtv->Release();
             return false;
         }
     } else {
-        if (!checkPresentHr("Present", g.swapChain->Present(1, DXGI_PRESENT_DO_NOT_SEQUENCE))) {
+        // Resize and Drain both take the POC pair: sync with the Intel
+        // output, then discard outstanding queued presents and queue the
+        // frame ASAP. (For Drain the frame is the current scene at the OLD
+        // size — the RESTART is what discards the in-flight flip of the
+        // previous Normal present; a lone blocking present does not
+        // discard it.)
+        syncIntelOutput();
+        if (!checkPresentHr(mode == PresentMode::Resize ? "Present(RESTART)" : "Present(drain RESTART)",
+                            g.swapChain->Present(0, DXGI_PRESENT_RESTART))) {
             bb->Release();
             rtv->Release();
             return false;
@@ -631,10 +663,11 @@ bool blitToSwapChain(bool resizeFrame) {
     bb->Release();
     rtv->Release();
 
-    if (resizeFrame) {
-        // POC: wait for a vblank to really make sure our frame with the new
-        // size is ready before the window finishes resizing.
-        return checkPresentHr("Present(DO_NOT_SEQUENCE)",
+    if (mode != PresentMode::Normal) {
+        // POC: wait for a vblank to really make sure our frame is ready
+        // before the window finishes resizing (Resize) / before the
+        // caller's ResizeBuffers runs (Drain).
+        return checkPresentHr(mode == PresentMode::Resize ? "Present(DO_NOT_SEQUENCE)" : "Present(drain DON)",
                               g.swapChain->Present(1, DXGI_PRESENT_DO_NOT_SEQUENCE));
     }
     return true;
@@ -755,7 +788,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g.frameDriver(w, h, frameDt(), g.frameDriverUser);
                         g.frameDrivenThisPump = true;
                     }
-                    if (blitToSwapChain(true)) {
+                    if (blitToSwapChain(PresentMode::Resize)) {
                         g.presentedOnce = true;
                     }
                 }
@@ -896,15 +929,16 @@ void uiPumpEvents(double timeoutSec) {
     }
 
     // 2) Drive + blit + present one frame unless the pump already did (a
-    //    resize frame). The blocking present paces the loop. The FIRST
-    //    frame takes the POC's resize present sequence (RESTART +
-    //    DO_NOT_SEQUENCE) — as the POC's first reposition does: a plain
-    //    DO_NOT_SEQUENCE on a freshly created swap chain is rejected
-    //    (DXGI_ERROR_INVALID_CALL) until the flip state has been started by
-    //    a RESTART present.
+    //    resize frame). Present(1, 0) paces the loop (vsync) and updates
+    //    the displayed content. The FIRST frame takes the POC's resize
+    //    present sequence (RESTART + DO_NOT_SEQUENCE) — as the POC's first
+    //    reposition does: its first present starts the flip state with a
+    //    RESTART (a plain DO_NOT_SEQUENCE on a freshly created swap chain
+    //    is rejected, DXGI_ERROR_INVALID_CALL, until then).
     if (!g.frameDrivenThisPump && g.frameDriver != nullptr) {
         g.frameDriver(g.pxW, g.pxH, frameDt(), g.frameDriverUser);
-        if (blitToSwapChain(!g.presentedOnce)) g.presentedOnce = true;
+        if (blitToSwapChain(g.presentedOnce ? PresentMode::Normal : PresentMode::Resize))
+            g.presentedOnce = true;
     }
 
     // 3) Sleep the remainder of the budget (usually ~0: the vsync present
@@ -955,12 +989,22 @@ void* uiWindowResize(uint32_t w, uint32_t h) {
     // (before WM_NCCALCSIZE returns).
     if (g.d3dDead || g.swapChain == nullptr || g.device == nullptr) return nullptr;
     if (w != g.scW || h != g.scH) {
+        // The last Normal present (Present(1, 0)) leaves a flip in flight
+        // until its vsync; ResizeBuffers must not run with one outstanding,
+        // and a flip left across ResizeBuffers can land afterwards as a
+        // glitch frame (flicker). Drain it with the POC's own pair (see
+        // PresentMode::Drain): the CURRENT scene is re-blitted (the last
+        // rendered frame — the new-size frame is not rendered yet, so there
+        // is no regression to an older one), the RESTART discards the
+        // in-flight flip, and the blocking DO_NOT_SEQUENCE leaves nothing
+        // outstanding. (Skipped before the first frame: nothing was ever
+        // presented, so nothing is in flight.)
+        // EXPERIMENT: drain disabled to isolate the resize pulse cause.
+        // if (g.presentedOnce && !blitToSwapChain(PresentMode::Drain)) return nullptr;
         // ResizeBuffers requires that ALL outstanding references to the swap
-        // chain's buffers are released first (MSDN). Satisfied by
-        // construction, exactly as in the POC: the per-frame back-buffer RTV
-        // is released after each present, and the last present before every
-        // resize is the blocking DO_NOT_SEQUENCE (the normal frame's present
-        // — it completed, so no flip is in flight). Only:
+        // chain's buffers are released first (MSDN). Satisfied: the per-frame
+        // back-buffer RTV is released after each present, and the drain
+        // present above has completed (blocking), so no flip is in flight.
         //  ClearState() — drop the last blit's (and bgfx's) pipeline
         //  bindings from the immediate context, then resize.
         g.dctx->ClearState();
