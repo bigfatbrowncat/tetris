@@ -68,7 +68,17 @@ static void onFrameDriver(uint32_t w, uint32_t h, double dt, void* user) {
 
 int main() {
     uiInit();
-    const UiWindow* window = uiCreateWindow(640, 640, "Tetris");
+    // TETRIS_WINDOW_SIZE="w h" (test hook, like TETRIS_SMOKE_TEST): the outer
+    // window size in device pixels; the default is 640x640.
+    uint32_t winW = 640, winH = 640;
+    if (const char* e = ::getenv("TETRIS_WINDOW_SIZE")) {
+        if (sscanf(e, "%u %u", &winW, &winH) == 2 && winW >= 32 && winH >= 32) {
+            fprintf(stderr, "[tetris] window size override: %ux%u\n", winW, winH);
+        } else {
+            fprintf(stderr, "[tetris] bad TETRIS_WINDOW_SIZE '%s' (want 'w h'); using 640x640\n", e);
+        }
+    }
+    const UiWindow* window = uiCreateWindow(winW, winH, "Tetris");
     if (!window) {
         fprintf(stderr, "[tetris] failed to create window\n");
         return 1;

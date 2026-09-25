@@ -62,6 +62,20 @@ const RGB kOverlayDim {0.05f, 0.05f, 0.07f};
 const RGB kOverlayHead{1.00f, 0.30f, 0.30f};
 const RGB kOverlaySub {0.75f, 0.78f, 0.85f};
 
+// Per-side screen-space inflation of solid (opaque, white-strip-textured)
+// quads, in pixels: adjacent solid quads overlap by 2*kSolidGrowPx. Closes
+// the 1px rasterization crack that opens when a shared edge lands exactly on
+// a pixel row/column CENTER: there the rasterizer's edge function is pure
+// float noise (signal ~1e-4 px^2 vs rounding ~0.01 px^2), so that pixel row
+// is only partly covered and whatever is behind (the light border ring) shows
+// through as a "white" horizontal/vertical line — at certain window sizes
+// only (e.g. the mid-board row when the client height is odd; every other
+// row when the px/unit scale is x.5). At a pixel BOUNDARY the tiling is exact
+// and no crack opens. The overlap puts the seam pixel ~kSolidGrowPx strictly
+// inside both quads, far beyond the noise; text quads are NOT inflated (the
+// atlas alpha must stay aligned to the glyph).
+constexpr float kSolidGrowPx = 0.75f;
+
 // World layout (1 world unit = 1 board cell). y grows up.
 const float WORLD_X0 = 0.0f, WORLD_Y0 = 0.0f, WORLD_X1 = 26.0f, WORLD_Y1 = 26.0f;
 const float BOARD_X0 = 12.0f, BOARD_Y0 = 3.0f;   // board left / bottom
@@ -413,7 +427,12 @@ public:
         }
 #endif
         verts.clear();
-        buildScene(verts, s);
+        // Per-side inflation for the solid quads (world units). The scene
+        // spans min(pw,ph) pixels over 26 world units (computeOrtho), so
+        // kSolidGrowPx of screen space is kSolidGrowPx/scale world units.
+        const float scale = (float)(pw < ph ? pw : ph) / 26.0f;
+        const float grow = scale > 0.0f ? kSolidGrowPx / scale : 0.0f;
+        buildScene(verts, s, grow);
         if (verts.empty()) return false;
 
         const bgfx::Memory* mem = bgfx::copy(verts.data(), (uint32_t)(verts.size() * sizeof(Vert)));
@@ -531,8 +550,15 @@ public:
     }
 
     // y0 = bottom, y1 = top (world y grows up). v grows down in the texture.
+    // grow (world units, per side) inflates the quad so adjacent solid quads
+    // overlap by 2*grow in screen space — see kSolidGrowPx. Only pass it for
+    // solid quads (the uniform white strip makes the stretch invisible).
     void addQuad(std::vector<Vert>& v, float x0, float y0, float x1, float y1,
-                 const UVRect& uv, float r, float g, float b) {
+                 const UVRect& uv, float r, float g, float b, float grow = 0.0f) {
+        x0 -= grow;
+        y0 -= grow;
+        x1 += grow;
+        y1 += grow;
         v.push_back({x0, y0, uv.u0, uv.v1, r, g, b});  // BL
         v.push_back({x1, y0, uv.u1, uv.v1, r, g, b});  // BR
         v.push_back({x0, y1, uv.u0, uv.v0, r, g, b});  // TL
@@ -552,43 +578,49 @@ public:
         }
     }
 
-    void drawNext(std::vector<Vert>& v, const TetrisBackend::Cell cells[4], float bx, float by) {
-        addQuad(v, bx, by, bx + 4, by + 4, solidUV(), kEmptyCell.r, kEmptyCell.g, kEmptyCell.b);
+    void drawNext(std::vector<Vert>& v, const TetrisBackend::Cell cells[4], float bx, float by,
+                  float grow = 0.0f) {
+        addQuad(v, bx, by, bx + 4, by + 4, solidUV(),
+                kEmptyCell.r, kEmptyCell.g, kEmptyCell.b, grow);
         for (int i = 0; i < 4; i++) {
             int dx = cells[i].x, dy = cells[i].y;
             int t = cells[i].color;
             float x0 = bx + dx, x1 = bx + dx + 1;
             float yBot = by + (3 - dy), yTop = by + (4 - dy);
             RGB c = kColor[t];
-            addQuad(v, x0, yBot, x1, yTop, solidUV(), c.r, c.g, c.b);
+            addQuad(v, x0, yBot, x1, yTop, solidUV(), c.r, c.g, c.b, grow);
         }
     }
 
-    void drawOverlay(std::vector<Vert>& v, const std::string& head, const std::string& sub) {
+    void drawOverlay(std::vector<Vert>& v, const std::string& head, const std::string& sub,
+                     float grow = 0.0f) {
         addQuad(v, BOARD_X0, BOARD_Y0, BOARD_X0 + W, BOARD_Y0 + H,
-                solidUV(), kOverlayDim.r, kOverlayDim.g, kOverlayDim.b);
+                solidUV(), kOverlayDim.r, kOverlayDim.g, kOverlayDim.b, grow);
         float cx = BOARD_X0 + W / 2.0f, cy = BOARD_Y0 + H / 2.0f;
         drawText(v, cx - head.size() * 0.6f, cy + 1.0f, head, kOverlayHead, 1.2f);
         drawText(v, cx - sub.size() * 0.4f, cy - 1.0f, sub, kOverlaySub, 0.8f);
     }
 
-    void buildScene(std::vector<Vert>& v, const TetrisBackend::Snapshot& s) {
-        // Board border ring (drawn behind the cells)
+    void buildScene(std::vector<Vert>& v, const TetrisBackend::Snapshot& s, float grow) {
+        // Board border ring (drawn behind the cells); inflated like the cells
+        // so the inflated outer cells stay fully inside the ring.
         addQuad(v, BOARD_X0 - 0.3f, BOARD_Y0 - 0.3f, BOARD_X0 + W + 0.3f, BOARD_Y0 + H + 0.3f,
-                solidUV(), kBorder.r, kBorder.g, kBorder.b);
+                solidUV(), kBorder.r, kBorder.g, kBorder.b, grow);
 
-        // Board cells (grid y=0 is the top row)
+        // Board cells (grid y=0 is the top row); inflated so adjacent cells
+        // overlap (kSolidGrowPx) and the shared-edge pixel is never left to
+        // the rasterizer's float-noise edge case.
         for (int y = 0; y < H; y++) {
             for (int x = 0; x < W; x++) {
                 int val = s.grid[y][x];
                 float x0 = BOARD_X0 + x, x1 = BOARD_X0 + x + 1;
                 float yTop = BOARD_Y0 + (H - y), yBot = BOARD_Y0 + (H - 1 - y);
                 RGB c = (val == EMPTY) ? kEmptyCell : kColor[val];
-                addQuad(v, x0, yBot, x1, yTop, solidUV(), c.r, c.g, c.b);
+                addQuad(v, x0, yBot, x1, yTop, solidUV(), c.r, c.g, c.b, grow);
             }
         }
 
-        // Ghost + current piece
+        // Ghost + current piece (solid quads: inflated like the cells)
         if (s.pieceColor >= 0) {
             for (int i = 0; i < 4; i++) {
                 int gx = s.ghost[i].x, gyy = s.ghost[i].y;
@@ -596,7 +628,7 @@ public:
                     RGB c = kColorDim[s.ghost[i].color];
                     addQuad(v, BOARD_X0 + gx, BOARD_Y0 + (H - 1 - gyy),
                             BOARD_X0 + gx + 1, BOARD_Y0 + (H - gyy),
-                            solidUV(), c.r, c.g, c.b);
+                            solidUV(), c.r, c.g, c.b, grow);
                 }
             }
             for (int i = 0; i < 4; i++) {
@@ -605,7 +637,7 @@ public:
                     RGB c = kColor[s.piece[i].color];
                     addQuad(v, BOARD_X0 + px, BOARD_Y0 + (H - 1 - py),
                             BOARD_X0 + px + 1, BOARD_Y0 + (H - py),
-                            solidUV(), c.r, c.g, c.b);
+                            solidUV(), c.r, c.g, c.b, grow);
                 }
             }
         }
@@ -618,7 +650,7 @@ public:
         drawText(v, PANEL_X, 15.0f, "LINES", kLabel);
         drawText(v, PANEL_X, 13.5f, std::to_string(s.lines), kValue);
         drawText(v, PANEL_X, 11.5f, "NEXT", kLabel);
-        drawNext(v, s.next, PANEL_X + 1, 6.5f);
+        drawNext(v, s.next, PANEL_X + 1, 6.5f, grow);
         drawText(v, PANEL_X, 4.5f, "HIGH", kLabel);
         drawText(v, PANEL_X, 3.0f, std::to_string(s.highScore), kValue);
 
@@ -633,8 +665,8 @@ public:
         drawText(v, 7.0f, 0.9f, c2, kControls, 0.55f);
 
         // Overlays
-        if (s.gameOver) drawOverlay(v, "GAME OVER", "r restart  -  q quit");
-        else if (s.paused) drawOverlay(v, "PAUSED", "press p to resume");
+        if (s.gameOver) drawOverlay(v, "GAME OVER", "r restart  -  q quit", grow);
+        else if (s.paused) drawOverlay(v, "PAUSED", "press p to resume", grow);
     }
 
     void computeOrtho(float* proj, uint32_t pw, uint32_t ph) const {
