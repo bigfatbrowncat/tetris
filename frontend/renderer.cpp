@@ -1,5 +1,5 @@
-// Renderer implementation (bgfx; Metal on macOS, OpenGL/EGL on Linux,
-// Direct3D 11 on Windows).
+// Renderer implementation (bgfx; Metal on macOS, Vulkan (offscreen) on
+// Linux, Direct3D 11 on Windows).
 #include "renderer.h"
 
 #include "font.h"
@@ -8,14 +8,6 @@
 
 #include <bgfx/bgfx.h>
 #include <bx/platform.h>
-
-#if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
-// Epoxy first: it defines __khrplatform_h_ itself, which suppresses the
-// duplicate khronos enum in the real KHR/khrplatform.h pulled in by EGL.
-#include <epoxy/gl.h>
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -197,16 +189,14 @@ public:
     const bgfx::Caps* caps = nullptr;
 
 #if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
-    // Linux GL area path: single-threaded bgfx on the UI thread, rendering the
-    // scene into the UI layer's shared scene texture (sceneTex) through the
-    // UI layer's pbuffer context (bgfx adopts it via Init.platformData.context).
-    bool m_glarea = false;
-    EGLDisplay m_eglDisplay = EGL_NO_DISPLAY;
-    EGLContext m_eglContext = EGL_NO_CONTEXT;
-    EGLSurface m_eglPbuffer = EGL_NO_SURFACE;
-    EGLSurface m_eglAreaSurf = EGL_NO_SURFACE;
-    GLuint m_sceneTex = 0;
-    bgfx::TextureHandle sceneRT = BGFX_INVALID_HANDLE;   // bgfx handle over sceneTex
+    // Linux offscreen path: single-threaded bgfx with the Vulkan backend
+    // renders the scene into an app-owned texture that is exactly the
+    // window's device-pixel size. Each frame the texture's memory is
+    // exported as a dma-buf (bgfx::getTextureDmaBuf) and handed to the UI
+    // layer (uiWindowSetFrameImage); the UI layer imports it into the GTK
+    // GL area's native GLES2 context and blits it 1:1 (GPU to GPU).
+    bool m_offscreen = false;
+    bgfx::TextureHandle sceneRT = BGFX_INVALID_HANDLE;
     bgfx::FrameBufferHandle sceneFB = BGFX_INVALID_HANDLE;
 #elif BX_PLATFORM_WINDOWS
     // Windows composition path: the UI layer's ID3D11Device* (adopted via
@@ -269,28 +259,11 @@ public:
         init.resolution.height = h != 0 ? h : 640;
         init.resolution.reset = 0;  // flip() never presents in this mode; vsync is the UI layer's Present
 #else
-        m_glarea = (win->offscreen != 0);
-        if (!m_glarea) {
-            fprintf(stderr, "[tetris] Linux windowed (non-GL-area) mode is not supported\n");
+        m_offscreen = (win->offscreen != 0);
+        if (!m_offscreen) {
+            fprintf(stderr, "[tetris] Linux windowed (non-offscreen) mode is not supported\n");
             return false;
         }
-        // eglAreaSurface may legitimately be NULL: on Wayland the GL area's
-        // context is surfaceless (GDK swaps the window surface itself in
-        // end_frame), and the UI layer re-binds it surfaceless before the
-        // blit.
-        if (win->eglDisplay == nullptr || win->eglContext == nullptr ||
-            win->sceneTex == 0) {
-            fprintf(stderr, "[tetris] GL area mode: the UI layer did not provide the EGL resources\n");
-            return false;
-        }
-        m_eglDisplay  = (EGLDisplay)win->eglDisplay;
-        m_eglContext  = (EGLContext)win->eglContext;
-        // NULL = surfaceless (EGL_NO_SURFACE): legal for a
-        // EGL_KHR_surfaceless_context, and what bgfx adopts as its (unused)
-        // surface.
-        m_eglPbuffer  = (EGLSurface)win->eglPbuffer;
-        m_eglAreaSurf = (EGLSurface)win->eglAreaSurface;
-        m_sceneTex    = win->sceneTex;
 
         // Single-threaded bgfx: latching bgfx::renderFrame() from this thread
         // (the UI thread that will drive bgfx::frame() inside the GL area's
@@ -298,22 +271,18 @@ public:
         // bgfx::frame() performs the GPU submit inline on the caller.
         bgfx::renderFrame();
 
-        // bgfx adopts the UI layer's shared pbuffer context; it must be
-        // current at bgfx::init time.
-        if (!eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext)) {
-            fprintf(stderr, "[tetris] cannot make the shared EGL context current (error 0x%x)\n", eglGetError());
-            return false;
-        }
-
-        init.type = bgfx::RendererType::OpenGL;   // the EGL backend
+        // Vulkan backend, headless: no native window handle, no backbuffer
+        // (all platform data stays NULL, resolution 0x0 — the requirements
+        // for bgfx's headless mode). The scene renders into an app-created
+        // texture (made on first render/resize); each frame its memory is
+        // exported as a dma-buf and handed to the UI layer, which blits it
+        // 1:1 into the GL area.
+        init.type = bgfx::RendererType::Vulkan;
         init.fallback = false;
         init.platformData.nwh = nullptr;
         init.platformData.ndt = nullptr;
-        init.platformData.context = win->eglContext;
-        // No backbuffer is ever used: the scene renders into sceneTex and the
-        // pbuffer is never presented (bgfx's flip() stays a no-op).
-        init.resolution.width = 1;
-        init.resolution.height = 1;
+        init.resolution.width = 0;
+        init.resolution.height = 0;
         init.resolution.reset = 0;
 #endif
         if (!bgfx::init(init)) {
@@ -350,9 +319,7 @@ public:
     void shutdown() {
         if (!ok) return;
 #if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
-        if (m_glarea) {
-            // The scene texture storage is sceneTex (shared; bgfx never
-            // deletes it); only the bgfx handles go away here.
+        if (m_offscreen) {
             if (bgfx::isValid(sceneFB)) { bgfx::destroy(sceneFB); sceneFB = BGFX_INVALID_HANDLE; }
             if (bgfx::isValid(sceneRT)) { bgfx::destroy(sceneRT); sceneRT = BGFX_INVALID_HANDLE; }
         }
@@ -404,26 +371,28 @@ public:
             lastH = ph;
         }
 #else
-        if (m_glarea) {
-            // Make the shared context current: the resize path below does raw
-            // GL work (overrideInternal) and bgfx's submit expects it too.
-            eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext);
-
-            if (pw != lastW || ph != lastH) {
-                // The UI layer re-created sceneTex at the new size before this
-                // call. Recreate the bgfx RT/FBO over it: the RT is created
-                // with the external texture id, so bgfx adopts sceneTex's
-                // storage (BGFX_SAMPLER_INTERNAL_SHARED — it never deletes it)
-                // and renders directly into the shared texture.
-                if (bgfx::isValid(sceneFB)) { bgfx::destroy(sceneFB); sceneFB = BGFX_INVALID_HANDLE; }
-                if (bgfx::isValid(sceneRT)) { bgfx::destroy(sceneRT); sceneRT = BGFX_INVALID_HANDLE; }
-                sceneRT = bgfx::createTexture2D(pw, ph, false, 1,
-                                                bgfx::TextureFormat::RGBA8, BGFX_TEXTURE_RT,
-                                                nullptr, (uint64_t)m_sceneTex);
-                sceneFB = bgfx::createFrameBuffer(1, &sceneRT);
-                lastW = pw;
-                lastH = ph;
+        if (m_offscreen && (pw != lastW || ph != lastH)) {
+            // The scene buffer is exactly the window's device-pixel size and
+            // is recreated on every size change (bgfx defers the actual GPU
+            // destruction of the old image until its referencing frames are
+            // done). BGFX_TEXTURE_DMA_BUF_EXPORT makes the image memory
+            // exportable as a dma-buf (bgfx::getTextureDmaBuf, consumed in
+            // endFrame); BGFX_TEXTURE_READ_BACK lets requestScreenShot read
+            // it back.
+            if (bgfx::isValid(sceneFB)) { bgfx::destroy(sceneFB); sceneFB = BGFX_INVALID_HANDLE; }
+            if (bgfx::isValid(sceneRT)) { bgfx::destroy(sceneRT); sceneRT = BGFX_INVALID_HANDLE; }
+            const uint64_t tflags = BGFX_TEXTURE_RT
+                | BGFX_TEXTURE_DMA_BUF_EXPORT
+                | BGFX_TEXTURE_READ_BACK;
+            sceneRT = bgfx::createTexture2D((uint16_t)pw, (uint16_t)ph, false, 1,
+                                            bgfx::TextureFormat::RGBA8, tflags, nullptr);
+            if (!bgfx::isValid(sceneRT)) {
+                fprintf(stderr, "[tetris] scene texture creation failed for %ux%u\n", pw, ph);
+                return false;
             }
+            sceneFB = bgfx::createFrameBuffer(1, &sceneRT);
+            lastW = pw;
+            lastH = ph;
         }
 #endif
         verts.clear();
@@ -444,9 +413,12 @@ public:
         bgfx::setViewTransform(0, view, proj);
         bgfx::setViewRect(0, 0, 0, (uint16_t)pw, (uint16_t)ph);
 #if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
-        if (m_glarea) {
-            // Render the scene into the shared texture. No depth attachment,
-            // so clear color only (the scene is 2D and never uses depth).
+        if (m_offscreen) {
+            // Render the scene into the app-owned scene texture. No depth
+            // attachment, so clear color only (the scene is 2D and never
+            // uses depth). The clear color matches the UI layer's exposed-
+            // strip clear (GTK CSS #101018), so a fresh resize strip blends
+            // in with the scene background.
             bgfx::setViewFrameBuffer(0, sceneFB);
             bgfx::setViewClear(0, BGFX_CLEAR_COLOR, 0x101018ff, 1.0f, 0);
         } else
@@ -473,14 +445,25 @@ public:
         if (!ok) return;
         bgfx::frame();
 #if !BX_PLATFORM_OSX && !BX_PLATFORM_WINDOWS
-        if (m_glarea) {
-            // bgfx::frame() (single-threaded) just issued the scene render
-            // into sceneTex on the shared context's stream. Flush it —
-            // glFinish() flushes the FBO — so the UI thread's blit, a
-            // different context and command stream in the same share group,
-            // never samples an in-flight write.
-            eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext);
-            glFinish();
+        if (m_offscreen) {
+            // Export the frame just rendered as a dma-buf and hand
+            // fd/modifier/pitch to the UI layer. bgfx::frame() (single-
+            // threaded) only submitted the scene render; getTextureDmaBuf
+            // waits for the GPU (vkDeviceWaitIdle) before exporting, so the
+            // fd always refers to a completed frame. The UI layer imports it
+            // into the GL area's GLES2 context on the same thread, right
+            // before its blit (GPU to GPU — only the texture crosses the
+            // Vulkan/GL boundary).
+            int32_t fd = -1;
+            uint64_t modifier = 0;
+            uint32_t pitch = 0;
+            if (bgfx::isValid(sceneRT)
+            &&  bgfx::getTextureDmaBuf(sceneRT, &fd, &modifier, &pitch)
+            &&  fd >= 0) {
+                uiWindowSetFrameImage(fd, modifier, pitch);
+            }
+            // On export failure the UI layer keeps blitting the previous
+            // frame's image (the slot is simply not updated).
         }
 #endif
     }
@@ -490,7 +473,7 @@ public:
 #if BX_PLATFORM_WINDOWS
         return;  // the UI layer's resize present (DO_NOT_SEQUENCE) is the sync
 #elif !BX_PLATFORM_OSX
-        if (m_glarea) return;  // the UI layer's blit is the present
+        if (m_offscreen) return;  // the UI layer's blit is the present
 #endif
         bgfx::frame();
         bgfx::frame();
@@ -514,34 +497,21 @@ public:
         }
         return;
 #elif !BX_PLATFORM_OSX
-        if (m_glarea) {
+        if (m_offscreen) {
             // bgfx::requestScreenShot only works on *window* frame buffers;
-            // sceneFB is a texture FBO. Read the shared scene texture back
-            // directly instead (C2 is current and flushed by endFrame()).
-            eglMakeCurrent(m_eglDisplay, m_eglPbuffer, m_eglPbuffer, m_eglContext);
-            glBindTexture(GL_TEXTURE_2D, m_sceneTex);
-            GLint w = 0, h = 0;
-            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            fprintf(stderr, "[dbg] requestScreenShot: %dx%d err=0x%x glerr=0x%x\n",
-                    w, h, eglGetError(), glGetError());
-            if (w > 0 && h > 0) {
-                // glReadPixels reads the read framebuffer, not a texture:
-                // attach sceneTex to a temporary FBO.
-                GLuint fbo = 0;
-                glGenFramebuffers(1, &fbo);
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
-                glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                       GL_TEXTURE_2D, m_sceneTex, 0);
-                std::vector<uint8_t> px((size_t)w * (size_t)h * 4);
-                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-                glDeleteFramebuffers(1, &fbo);
-                // glReadPixels row 0 is the texture bottom; BMP row 0 is the
-                // bottom too — no flip.
-                writeBmp(path, (uint32_t)w, (uint32_t)h, (uint32_t)(w * 4),
-                         px.data(), false, false);
+            // sceneFB is a texture FBO. Read the scene texture back with
+            // bgfx::read instead (synchronous: readTexture kicks the command
+            // queue with a fence wait). The readback is a straight row copy —
+            // row 0 is the image top (Vulkan NDC +Y), which is also the BMP
+            // convention, so no flip.
+            if (bgfx::isValid(sceneRT) && lastW > 0 && lastH > 0) {
+                bgfx::TextureRegion region;
+                region.init(sceneRT);
+                std::vector<uint8_t> px((size_t)lastW * lastH * 4);
+                bgfx::read(region, px.data());
+                bgfx::frame();
+                writeBmp(path, lastW, lastH, (uint32_t)(lastW * 4), px.data(),
+                         /*yflip=*/false, /*isBgra=*/false);
             }
             return;
         }

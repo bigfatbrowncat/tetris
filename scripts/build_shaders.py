@@ -7,8 +7,8 @@ Writes ONLY to <out-dir> (a directory inside the CMake build tree):
   <out-dir>/vs_quad.h   <out-dir>/fs_quad.h
 
 macOS   -> Metal shaders
-Linux   -> GLSL 4.30 text (profile "430") — bgfx's OpenGL/EGL backend
-            compiles the embedded GLSL; it needs a desktop GLSL source, not
+Linux   -> SPIR-V 1.3 (profile "spirv13-11", Vulkan 1.1) — bgfx's Vulkan
+            backend (the offscreen scene renderer) compiles the embedded
             SPIR-V.
 Windows -> HLSL 5.0 (profile "s_5_0") — bgfx's Direct3D11 backend compiles
             the embedded DXBC; it needs a shaderc --platform windows build.
@@ -27,7 +27,7 @@ if IS_MACOS:
 elif IS_WINDOWS:
     PLATFORM, PROFILE = "windows", "s_5_0"
 else:
-    PLATFORM, PROFILE = "linux", "430"
+    PLATFORM, PROFILE = "linux", "spirv13-11"
 
 # Defaults for running the script standalone (no CMake).
 DEFAULT_SHADERC = os.path.join(

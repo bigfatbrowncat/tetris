@@ -17,41 +17,54 @@
 //     from the display's type, before GSK picks a renderer.
 //
 // Frame transfer (renderer -> window), GPU to GPU, no CPU copy:
-//   C1 — the GL area's context, created by GDK. The render callback runs
-//        with C1 current; the callback draws into the area's own offscreen
-//        texture, which GSK then composites into the window.
-//   C2 — a 4.3-core context sharing C1 (same share group), current in
-//        surfaceless mode (EGL_KHR_surfaceless_context) — on a 1x1 pbuffer on
-//        displays lacking that extension. bgfx adopts C2 (via
-//        Init.platformData.context) *and the surface current on it*, and skips
-//        every swap when that surface is EGL_NO_SURFACE. It renders the scene
-//        into sceneTex (a texture this layer owns) through an FBO; no view
-//        ever targets a default framebuffer, so nothing is ever presented.
-//   sceneTex — RGBA8, kept at the window's device-pixel size. Because C1 and
-//        C2 share, the callback can bind the name bgfx wrote in the other
-//        context.
+//   The game renders offscreen: bgfx (Vulkan backend, headless) draws the
+//   scene into a texture that is exactly the window's device-pixel size
+//   (re-created on resize). Each frame its memory is exported as a dma-buf
+//   (bgfx::getTextureDmaBuf — it waits for the GPU, so the fd always refers
+//   to a completed frame) and handed here (uiWindowSetFrameImage, same
+//   thread as the render callback). This layer imports the dma-buf into the
+//   GL area's *natural* GLES2 context (C1, created by GDK) with
+//   eglCreateImage(EGL_LINUX_DMA_BUF_EXT, DRM_FORMAT_ABGR8888, ...) +
+//   glEGLImageTargetTexture2DOES on a persistent texture name, and blits it
+//   1:1 full-frame. Only the texture crosses the Vulkan/GL boundary — the
+//   buffer is shared through the kernel's dma-buf/prime; there is no second
+//   GL context and no other GPU state shared between the two APIs.
 //
-// Per-frame ordering inside the render callback (bgfx is single-threaded and
-// the game runs on this thread, so all GL state transitions are on one
-// thread):
-//   1. glFinish() on C1 — the previous frame's blit read sceneTex; flush it
-//      so the texture may be rewritten. glFinish() flushes the FBO/texture
-//      writes of the current context's stream.
-//   2. Re-create sceneTex at the new size if the window resized (a freshly
-//      exposed strip must never show the desktop: step 3 clears it with the
-//      scene's background color first). This runs raw GL on C1 and must
-//      restore the FBO binding it finds (on a resize frame that is the area
-//      FBO GTK bound in attach_buffers), or step 4's blit would miss it.
-//   3. driver(w, h, dt) — the frontend: game update, scene render into
-//      sceneTex with C2, bgfx::frame(), glFinish() on C2.
-//   4. Re-bind C1, clear the area's texture with the scene's clear color and
-//      draw a full-frame quad sampling sceneTex 1:1 (pinned top-left; the
-//      texture is always exactly the window size, so nothing is stretched).
+//   C1 is GLES2 (gtk_gl_area_set_use_es(TRUE) + required version 2.0): on
+//   some GPUs (NVIDIA) any on-screen 3D context for GTK4 that is not GLESv2
+//   flickers. Everything this layer draws is GLES2-core.
+//
+// Per-frame ordering inside the render callback (the game runs on this
+// thread, so all state transitions are on one thread):
+//   1. glFinish() on C1 — the previous frame's blit read the scene texture
+//      (the imported EGLImage); flush it so the image can be destroyed and
+//      the texture re-targeted.
+//   2. Destroy the previous frame's EGLImage (it owns the dma-buf fd; the
+//      driver closes it on destruction).
+//   3. driver(w, h, dt) — the frontend: game update, scene render (bgfx,
+//      Vulkan, offscreen), bgfx::frame(), getTextureDmaBuf,
+//      uiWindowSetFrameImage (the new frame's dma-buf lands in the slot).
+//   4. Consume the slot: import the dma-buf into the scene texture
+//      (eglCreateImageKHR + glEGLImageTargetTexture2DOES). On import
+//      failure close the fd and keep the previous frame's image (the blit
+//      below re-copies it — no flicker).
+//   5. Clear the area's texture with the scene's background (0x101018 —
+//      covers a freshly exposed resize strip, whose pixels the blit does
+//      not touch) and draw a full-frame triangle sampling the scene texture
+//      1:1 (pinned top-left; the texture is always exactly the window's
+//      size, so nothing is stretched).
+//
+// Orientation: the scene texture's row 0 (v=0) is the *top* of the scene
+// (Vulkan NDC +Y), and the window top is NDC y=+1 — the blit triangle's uv
+// is therefore v-flipped relative to the classic desktop-GL oversized
+// triangle (v=0 at the window bottom).
+//
 // Epoxy before EGL: it defines __khrplatform_h_ itself, which suppresses the
 // duplicate khronos enum in the real KHR/khrplatform.h pulled in by EGL.
 #include <epoxy/gl.h>
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <libdrm/drm_fourcc.h>
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
 
@@ -59,6 +72,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <deque>
 #include <mutex>
 #include "ui/window.h"
@@ -81,18 +95,15 @@ static UiFrameDriver s_frameDriver = nullptr;
 static void* s_frameDriverUser = nullptr;
 static gint64 s_lastFrameNs = 0;
 
-// The GL resource pair. C1 (the area's context) is created by GDK at
-// realize; C2 and the scene texture are created here, both sharing C1's
-// share group.
+// C1 (the area's context, GLES2) is created by GDK at realize. The scene
+// texture name is persistent; each frame's dma-buf is imported as an
+// EGLImage and re-targeted onto it (see onRender).
 struct GLRes {
     bool ready = false;
     EGLDisplay display = EGL_NO_DISPLAY;
-    EGLContext areaCtx = EGL_NO_CONTEXT;    // C1
-    EGLSurface areaSurf = EGL_NO_SURFACE;   // C1's window surface
-    EGLContext bgfxCtx = EGL_NO_CONTEXT;    // C2 (shares C1)
-    EGLSurface pbuffer  = EGL_NO_SURFACE;   // C2's 1x1 placeholder surface
-    GLuint sceneTex = 0;                    // the shared scene texture
-    uint32_t texW = 0, texH = 0;
+    EGLContext areaCtx = EGL_NO_CONTEXT;
+    GLuint sceneTex = 0;                // the persistent scene texture name
+    EGLImage currentImage = EGL_NO_IMAGE;  // the frame bound to sceneTex
     // The full-frame blit pipeline (built in C1).
     GLuint blitProg = 0;
     GLuint blitVao = 0;
@@ -100,6 +111,17 @@ struct GLRes {
     GLint blitTexLoc = -1;
 };
 static GLRes s_gl;
+
+// The per-frame dma-buf handoff (uiWindowSetFrameImage -> onRender). Both
+// sides run on the UI thread (the frame driver is invoked from the render
+// callback), so no lock is needed.
+struct FrameSlot {
+    int32_t fd = -1;
+    uint64_t modifier = 0;
+    uint32_t pitch = 0;
+    bool valid = false;
+};
+static FrameSlot s_frame;
 
 // ---------------------------------------------------------------------------
 // input
@@ -166,27 +188,29 @@ static gboolean resizeTestTick(gpointer user) {
 }
 
 // ---------------------------------------------------------------------------
-// the full-frame blit (C1): one oversized triangle covering the viewport,
-// sampling sceneTex 1:1. sceneTex is always exactly the window's device size
-// (re-created on resize, step 2), so the quad is a pure 1:1 copy — no
+// the full-frame blit (C1, GLES2): one oversized triangle covering the
+// viewport, sampling the scene texture 1:1. The scene texture is always
+// exactly the window's device size (re-created by the renderer on resize,
+// re-imported every frame), so the triangle is a pure 1:1 copy — no
 // scaling, no stretching of a stale frame.
+//
+// The uv is v-flipped (see the file header): the image top (v=0) lands at
+// the window top (NDC y=+1).
 // ---------------------------------------------------------------------------
 static const char *BLIT_VS =
-    "#version 330 core\n"
-    "layout(location = 0) in vec2 in_pos;   /* NDC, [-1, 1] */\n"
-    "layout(location = 1) in vec2 in_uv;\n"
-    "out vec2 v_uv;\n"
+    "attribute vec2 in_pos;   /* NDC, [-1, 1] */\n"
+    "attribute vec2 in_uv;\n"
+    "varying vec2 v_uv;\n"
     "void main() {\n"
     "    v_uv = in_uv;\n"
     "    gl_Position = vec4(in_pos, 0.0, 1.0);\n"
     "}\n";
 
 static const char *BLIT_FS =
-    "#version 330 core\n"
-    "in vec2 v_uv;\n"
+    "precision mediump float;\n"
+    "varying vec2 v_uv;\n"
     "uniform sampler2D s_tex;\n"
-    "out vec4 out_color;\n"
-    "void main() { out_color = vec4(texture(s_tex, v_uv).rgb, 1.0); }\n";
+    "void main() { gl_FragColor = vec4(texture2D(s_tex, v_uv).rgb, 1.0); }\n";
 
 static GLuint compileShader(GLenum type, const char* src) {
     GLuint sh = glCreateShader(type);
@@ -226,11 +250,12 @@ static void blitBuild(void) {
     s_gl.blitTexLoc = glGetUniformLocation(s_gl.blitProg, "s_tex");
 
     // One triangle covering the viewport (uv overscans to 2; CLAMP_TO_EDGE
-    // makes the edge texels repeat, so no seam).
+    // makes the edge texels repeat, so no seam). v is flipped: the image
+    // top (v=0) lands at the window top (NDC y=+1).
     const GLfloat verts[12] = {
-        -1.0f, -1.0f, 0.0f, 0.0f,
-         3.0f, -1.0f, 2.0f, 0.0f,
-        -1.0f,  3.0f, 0.0f, 2.0f,
+        -1.0f, -1.0f, 0.0f, 1.0f,
+         3.0f, -1.0f, 2.0f, 1.0f,
+        -1.0f,  3.0f, 0.0f, -1.0f,
     };
     glGenVertexArrays(1, &s_gl.blitVao);
     glGenBuffers(1, &s_gl.blitVbo);
@@ -244,51 +269,11 @@ static void blitBuild(void) {
     glBindVertexArray(0);
 }
 
-// C1 is current. Keeps sceneTex allocated at (w, h); on (re)creation it is
-// filled with the scene's clear color so a blit before the first rendered
-// frame (or a freshly exposed resize strip) shows the background, never
-// undefined storage.
-static void sceneTexEnsure(uint32_t w, uint32_t h) {
-    if (s_gl.sceneTex == 0) glGenTextures(1, &s_gl.sceneTex);
-    if (s_gl.sceneTex == 0) return;
-    if (s_gl.texW == w && s_gl.texH == h) return;
-
-    glBindTexture(GL_TEXTURE_2D, s_gl.sceneTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h, 0,
-                 GL_BGRA, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    s_gl.texW = w;
-    s_gl.texH = h;
-
-    // Clear the fresh storage with the scene's background (0x101018).
-    // Save/restore the FBO binding: on a resize frame GTK has already bound
-    // the GL area's FBO (attach_buffers, before the render signal) and the
-    // full-frame blit later draws into it. Binding 0 here would send the
-    // blit to the default framebuffer and leave the freshly re-allocated
-    // area texture holding the previous frame re-pitched at the new size —
-    // the per-row horizontal shift seen while resizing.
-    GLint prevFbo = 0;
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
-    GLuint fbo = 0;
-    glGenFramebuffers(1, &fbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                           GL_TEXTURE_2D, s_gl.sceneTex, 0);
-    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
-    glClearColor(16.0f / 255.0f, 16.0f / 255.0f, 24.0f / 255.0f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT);
-    glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFbo);
-    glDeleteFramebuffers(1, &fbo);
-}
-
 // ---------------------------------------------------------------------------
-// GL setup: grab the area's context (C1), create C2 sharing it on a pbuffer,
-// and the scene texture. Called once after the area is realized.
+// GL setup: grab the area's context (C1) and build the blit pipeline + the
+// persistent scene texture. Called once after the area is realized.
 // ---------------------------------------------------------------------------
-static bool setupGL(uint32_t w, uint32_t h) {
+static bool setupGL(void) {
     gtk_gl_area_make_current(GTK_GL_AREA(s_area));
     GError* err = gtk_gl_area_get_error(GTK_GL_AREA(s_area));
     if (err != NULL) {
@@ -296,147 +281,71 @@ static bool setupGL(uint32_t w, uint32_t h) {
         return false;
     }
 
-    // GDK creates the area's context with GLX when the X11 server has no
-    // usable EGL. This bgfx build's GL backend is EGL-only, and a GLX
-    // context cannot share with an EGL one — fail loudly in that case.
+    // The dma-buf import (eglCreateImage + glEGLImageTargetTexture2DOES)
+    // needs an EGL context. GDK creates the area's context with GLX when the
+    // X11 server has no usable EGL — fail loudly in that case.
     EGLContext c1 = eglGetCurrentContext();
     if (c1 == EGL_NO_CONTEXT) {
         fprintf(stderr,
             "[window] FATAL: the GTK GL context is not EGL (GLX fallback on this"
-            " X11 server). The EGL bgfx backend requires an EGL display context;"
-            " texture sharing with a GLX context is not possible.\n");
+            " X11 server). The dma-buf frame import requires an EGL context;\n"
+            "import into a GLX context is not possible.\n");
         return false;
     }
 
-    s_gl.display  = eglGetCurrentDisplay();
-    s_gl.areaCtx  = c1;
-    s_gl.areaSurf = eglGetCurrentSurface(EGL_DRAW);
+    s_gl.display = eglGetCurrentDisplay();
+    s_gl.areaCtx = c1;
 
-    // The client API is bound per-thread, per-display. This thread must be
-    // bound to the desktop OpenGL API to create desktop contexts (GDK does
-    // the same before creating the area's context).
-    if (!eglBindAPI(EGL_OPENGL_API)) {
-        fprintf(stderr, "[window] FATAL: eglBindAPI(EGL_OPENGL_API) failed (error 0x%x)\n", eglGetError());
-        return false;
-    }
-
-    // C2 needs a way to be current. Prefer surfaceless
-    // (EGL_KHR_surfaceless_context): the Wayland platform display the GL
-    // area's context lives on exposes no PBUFFER configs, and surfaceless
-    // needs no surface at all.
+    // The display must be able to import dma-bufs (Mesa: the DRI2 driver).
     const char* exts = eglQueryString(s_gl.display, EGL_EXTENSIONS);
-    const bool surfaceless =
-        exts != nullptr && strstr(exts, "EGL_KHR_surfaceless_context") != nullptr;
-
-    // A config, when one is needed (the pbuffer fallback).
-    EGLConfig cfg = NULL;
-    if (!surfaceless) {
-        const EGLint cfgAttrs[] = {
-            EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
-            EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
-            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-            EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8,
-            EGL_NONE,
-        };
-        EGLint num = 0;
-        if (!eglChooseConfig(s_gl.display, cfgAttrs, &cfg, 1, &num) || num < 1) {
-            fprintf(stderr, "[window] FATAL: no EGL pbuffer config (error 0x%x)\n", eglGetError());
-            return false;
-        }
-    }
-
-    // C2: desktop core 4.3 (bgfx's OpenGL requirement), sharing C1's group.
-    // Some platform displays (Wayland) expose only *configless* contexts —
-    // their configs exist for visual matching but cannot create contexts
-    // (GDK itself creates the area's context configless). Try config-based
-    // first, then configless (EGL_MESA_configless_context).
-    if (getenv("TETRIS_EGL_DEBUG")) {
-        const char* v1 = (const char*)glGetString(GL_VERSION);
-        fprintf(stderr, "[dbg] C1 GL version: %s\n", v1 ? v1 : "(null)");
-        EGLint c1cfgId = 0;
-        eglQueryContext(s_gl.display, c1, EGL_CONFIG_ID, &c1cfgId);
-        fprintf(stderr, "[dbg] C1 config id=%d\n", c1cfgId);
-        // a real window config, like GDK's
-        EGLint wcfg[] = { EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
-                          EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE };
-        EGLConfig wc = NULL; EGLint wn = 0;
-        eglChooseConfig(s_gl.display, wcfg, &wc, 1, &wn);
-        fprintf(stderr, "[dbg] window config: %d found\n", wn);
-        for (int maj = 3; maj <= 5; maj++)
-        for (int min = 0; min <= 6; min++) {
-            if (maj == 3 && min < 3) continue;
-            if (maj == 5 && min > 2) continue;
-            if (wc) {
-                EGLint a[] = { EGL_CONTEXT_MAJOR_VERSION, maj, EGL_CONTEXT_MINOR_VERSION, min, EGL_NONE };
-                EGLContext t = eglCreateContext(s_gl.display, wc, EGL_NO_CONTEXT, a);
-                if (t != EGL_NO_CONTEXT) {
-                    fprintf(stderr, "[dbg] withconfig %d.%d OK (no profile) err=0x%x\n", maj, min, eglGetError());
-                    eglDestroyContext(s_gl.display, t);
-                }
-            }
-            EGLint ap[] = { EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-                            EGL_CONTEXT_MAJOR_VERSION, maj, EGL_CONTEXT_MINOR_VERSION, min, EGL_NONE };
-            EGLContext tp = eglCreateContext(s_gl.display, NULL, EGL_NO_CONTEXT, ap);
-            if (tp != EGL_NO_CONTEXT) {
-                fprintf(stderr, "[dbg] configless %d.%d OK (core)\n", maj, min);
-                eglDestroyContext(s_gl.display, tp);
-            }
-        }
-        EGLint as_[] = { EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 3,
-                         EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE };
-        EGLContext ts = eglCreateContext(s_gl.display, NULL, c1, as_);
-        fprintf(stderr, "[dbg] configless 4.3-core share C1: %p err=0x%x\n", (void*)ts, eglGetError());
-        if (ts != EGL_NO_CONTEXT) eglDestroyContext(s_gl.display, ts);
-        if (wc) {
-            EGLContext tw = eglCreateContext(s_gl.display, wc, c1, as_);
-            fprintf(stderr, "[dbg] withconfig 4.3-core share C1: %p err=0x%x\n", (void*)tw, eglGetError());
-            if (tw != EGL_NO_CONTEXT) eglDestroyContext(s_gl.display, tw);
-        }
-    }
-
-    const EGLint ctxAttrs[] = {
-        EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
-        EGL_CONTEXT_MAJOR_VERSION_KHR, 4,
-        EGL_CONTEXT_MINOR_VERSION_KHR, 3,
-        EGL_NONE,
-    };
-    s_gl.bgfxCtx = eglCreateContext(s_gl.display, cfg, c1, ctxAttrs);
-    if (s_gl.bgfxCtx == EGL_NO_CONTEXT)
-        s_gl.bgfxCtx = eglCreateContext(s_gl.display, NULL, c1, ctxAttrs);
-    if (s_gl.bgfxCtx == EGL_NO_CONTEXT)
-        s_gl.bgfxCtx = eglCreateContext(s_gl.display, NULL, c1, NULL);
-    if (s_gl.bgfxCtx == EGL_NO_CONTEXT) {
-        fprintf(stderr, "[window] FATAL: cannot create the shared EGL context (error 0x%x)\n", eglGetError());
+    if (exts == nullptr || strstr(exts, "EGL_EXT_image_dma_buf_import") == nullptr) {
+        fprintf(stderr,
+            "[window] FATAL: the EGL display lacks EGL_EXT_image_dma_buf_import"
+            " (needed to import the renderer's Vulkan frames as dma-bufs).\n");
         return false;
     }
 
-    if (!surfaceless) {
-        const EGLint pbAttrs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
-        s_gl.pbuffer = eglCreatePbufferSurface(s_gl.display, cfg, pbAttrs);
-        if (s_gl.pbuffer == EGL_NO_SURFACE) {
-            fprintf(stderr, "[window] FATAL: cannot create the 1x1 pbuffer (error 0x%x)\n", eglGetError());
-            return false;
-        }
-    }
-    // Make C2 current — on the pbuffer, or surfaceless (EGL_NO_SURFACE).
-    // bgfx adopts whichever surface is current at bgfx::init time.
-    if (!eglMakeCurrent(s_gl.display, s_gl.pbuffer, s_gl.pbuffer, s_gl.bgfxCtx)) {
-        fprintf(stderr, "[window] FATAL: cannot make the shared context current (error 0x%x)\n", eglGetError());
-        return false;
-    }
-
-    // The scene texture (shared group: visible from C1 and C2 alike).
+    // The persistent scene texture name. Its storage is re-targeted every
+    // frame with glEGLImageTargetTexture2DOES (the imported dma-buf — no
+    // glTexImage2D, the storage IS the imported buffer); the parameters are
+    // set once and survive the re-target.
     glGenTextures(1, &s_gl.sceneTex);
-    sceneTexEnsure(w, h);
+    glBindTexture(GL_TEXTURE_2D, s_gl.sceneTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
-    // The blit pipeline lives in C1.
-    if (!eglMakeCurrent(s_gl.display, s_gl.areaSurf, s_gl.areaSurf, s_gl.areaCtx)) {
-        fprintf(stderr, "[window] FATAL: cannot re-bind the area context (error 0x%x)\n", eglGetError());
-        return false;
-    }
+    // The blit pipeline (C1).
     blitBuild();
     s_gl.ready = true;
     return true;
+}
+
+// C1 is current. Imports the dma-buf (fd, modifier, pitch — RGBA8, w x h)
+// as an EGLImage. DRM_FORMAT_ABGR8888: the fourcc names list the channels
+// MSB to LSB, so the little-endian memory layout is [R, G, B, A] —
+// byte-identical to the renderer's VK_FORMAT_R8G8B8A8_UNORM image. On
+// success the image owns the fd (closed when the image is destroyed); on
+// failure the caller still owns it and must close it.
+static EGLImage importDmaBuf(int32_t fd, uint64_t modifier, uint32_t pitch,
+                             uint32_t w, uint32_t h) {
+    const EGLAttrib attrs[] = {
+        EGL_WIDTH, (EGLAttrib)w,
+        EGL_HEIGHT, (EGLAttrib)h,
+        EGL_LINUX_DRM_FOURCC_EXT, (EGLAttrib)DRM_FORMAT_ABGR8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT, (EGLAttrib)fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLAttrib)pitch,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLAttrib)(modifier & 0xffffffffu),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLAttrib)(modifier >> 32),
+        EGL_NONE,
+    };
+    // eglCreateImage (core EGL 1.5) — the KHR alias is not a separate
+    // exported symbol in Mesa's libEGL.
+    return eglCreateImage(s_gl.display, EGL_NO_CONTEXT,
+                          EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,27 +353,31 @@ static bool setupGL(uint32_t w, uint32_t h) {
 // ---------------------------------------------------------------------------
 static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) {
     (void)area; (void)context; (void)user;
-    if (getenv("TETRIS_EGL_DEBUG")) {
-        static int n = 0;
-        fprintf(stderr, "[dbg] onRender #%d ready=%d\n", ++n, (int)s_gl.ready);
-    }
     if (!s_gl.ready) return TRUE;
 
-    // C1 is current (GTK made it so before emitting "render").
+    // C1 is current (GTK made it so before emitting "render"); the area's
+    // FBO is bound (attach_buffers).
     const int scale = gtk_widget_get_scale_factor(GTK_WIDGET(s_area));
     const uint32_t w = (uint32_t)gtk_widget_get_width(GTK_WIDGET(s_area)) * (uint32_t)scale;
     const uint32_t h = (uint32_t)gtk_widget_get_height(GTK_WIDGET(s_area)) * (uint32_t)scale;
     if (w == 0 || h == 0) return TRUE;
 
-    // 1) The previous frame's blit read sceneTex from C1's stream; flush it
-    //    so the texture may be re-written (glFinish() flushes the FBO).
+    // 1) The previous frame's blit read the scene texture (the imported
+    //    EGLImage); flush it (glFinish() flushes the FBO) so the image can
+    //    be destroyed and the texture re-targeted.
     glFinish();
 
-    // 2) Keep the shared scene texture at the current device size.
-    sceneTexEnsure(w, h);
+    // 2) The previous frame's image is no longer read — destroy it (it owns
+    //    the dma-buf fd, which the driver closes on destruction).
+    if (s_gl.currentImage != EGL_NO_IMAGE) {
+        eglDestroyImage(s_gl.display, s_gl.currentImage);
+        s_gl.currentImage = EGL_NO_IMAGE;
+    }
 
-    // 3) Drive the game: update + render the scene into sceneTex (C2) +
-    //    bgfx::frame() + glFinish() on C2.
+    // 3) Drive the game: update + render the scene (bgfx, Vulkan,
+    //    offscreen) + bgfx::frame() + getTextureDmaBuf +
+    //    uiWindowSetFrameImage. The driver leaves the new frame's dma-buf
+    //    in the slot (and only a completed one — it waits for the GPU).
     if (s_frameDriver != nullptr) {
         double dt = 0.0;
         const gint64 now = g_get_monotonic_time();
@@ -473,16 +386,32 @@ static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) 
         s_frameDriver(w, h, dt, s_frameDriverUser);
     }
 
-    // 4) Present: re-bind C1, clear with the scene's background (covers a
-    //    freshly exposed resize strip) and copy sceneTex full-frame, 1:1.
-    if (!eglMakeCurrent(s_gl.display, s_gl.areaSurf, s_gl.areaSurf, s_gl.areaCtx)) {
-        fprintf(stderr, "[window] FATAL: cannot re-bind the area context (error 0x%x)\n", eglGetError());
-        return TRUE;
+    // 4) Consume the slot: import the new frame into the scene texture.
+    //    On import failure close the fd and keep the previous frame's image
+    //    (the blit below re-copies it — no flicker).
+    if (s_frame.valid) {
+        EGLImage img = importDmaBuf(s_frame.fd, s_frame.modifier, s_frame.pitch, w, h);
+        const int32_t fd = s_frame.fd;
+        s_frame.valid = false;
+        if (img != EGL_NO_IMAGE) {
+            glBindTexture(GL_TEXTURE_2D, s_gl.sceneTex);
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            s_gl.currentImage = img;  // the image owns the fd now
+        } else {
+            fprintf(stderr, "[window] dma-buf import failed (error 0x%x); keeping the previous frame\n",
+                    eglGetError());
+            ::close(fd);
+        }
     }
+
+    // 5) Present: clear the area's texture with the scene's background
+    //    (covers a freshly exposed resize strip) and copy the scene texture
+    //    full-frame, 1:1.
     glViewport(0, 0, (GLsizei)w, (GLsizei)h);
     glClearColor(16.0f / 255.0f, 16.0f / 255.0f, 24.0f / 255.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    if (s_gl.sceneTex != 0) {
+    if (s_gl.currentImage != EGL_NO_IMAGE) {
         glUseProgram(s_gl.blitProg);
         glUniform1i(s_gl.blitTexLoc, 0);
         glActiveTexture(GL_TEXTURE0);
@@ -496,17 +425,11 @@ static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) 
         static bool loggedOnce = false;
         if (!loggedOnce) {
             loggedOnce = true;
-            const char* exts = eglQueryString(s_gl.display, EGL_EXTENSIONS);
-            fprintf(stderr, "[dbg] EGL_MESA_image_dma_buf_export: %s\n",
-                    exts && strstr(exts, "EGL_MESA_image_dma_buf_export") != nullptr
-                        ? "YES (GtkGLArea presents via the dmabuf path)"
-                        : "no (GL texture download path)");
             const char* r = (const char*)glGetString(GL_RENDERER);
             fprintf(stderr, "[dbg] C1 renderer: %s\n", r ? r : "(null)");
         }
-        // fboTex is the texture id GTK attached to the area FBO — exactly the
-        // image GSK will present this frame. If it ping-pongs between two ids
-        // while the blit lands elsewhere, that is the glitch.
+        // fboTex is the texture id GTK attached to the area FBO — exactly
+        // the image GSK will present this frame.
         GLint fbo = 0;
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
         GLuint fboTex = 0;
@@ -514,9 +437,9 @@ static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) 
             glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                                   GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
                                                   (GLint*)&fboTex);
-        fprintf(stderr, "[dbg] frame w=%u h=%u fbo=%d fboTex=%u sceneTex=%u texW=%u texH=%u glerr=0x%x\n",
-                w, h, (int)fbo, (unsigned)fboTex, (unsigned)s_gl.sceneTex,
-                s_gl.texW, s_gl.texH, (unsigned)glGetError());
+        fprintf(stderr, "[dbg] frame w=%u h=%u img=%d fbo=%d fboTex=%u sceneTex=%u glerr=0x%x\n",
+                w, h, (int)(s_gl.currentImage != EGL_NO_IMAGE), (int)fbo,
+                (unsigned)fboTex, (unsigned)s_gl.sceneTex, (unsigned)glGetError());
     }
 
     return TRUE;  // we handled the draw
@@ -549,10 +472,13 @@ void uiInit(void) {
     GdkDisplay* display = gdk_display_get_default();
     if (display != NULL) {
         const char* backend_type = G_OBJECT_TYPE_NAME(display);
-        if (g_strcmp0(backend_type, "GdkWaylandDisplay") == 0) {
-            g_setenv("GSK_RENDERER", "vulkan", TRUE);
-        } else if (g_strcmp0(backend_type, "GdkX11Display") == 0) {
-            g_setenv("GSK_RENDERER", "cairo", TRUE);
+        // An explicit GSK_RENDERER in the environment wins (test hook).
+        if (g_getenv("GSK_RENDERER") == NULL) {
+            if (g_strcmp0(backend_type, "GdkWaylandDisplay") == 0) {
+                g_setenv("GSK_RENDERER", "vulkan", TRUE);
+            } else if (g_strcmp0(backend_type, "GdkX11Display") == 0) {
+                g_setenv("GSK_RENDERER", "cairo", TRUE);
+            }
         }
     }
 }
@@ -570,10 +496,11 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     gtk_window_set_titlebar(GTK_WINDOW(s_win), s_header);
 
     s_area = gtk_gl_area_new();
-    // Desktop GL 3.3 core for the blit pipeline (the scene texture and the
-    // full-frame quad); the game itself renders in the 4.3 context C2.
-    gtk_gl_area_set_use_es(GTK_GL_AREA(s_area), FALSE);
-    gtk_gl_area_set_required_version(GTK_GL_AREA(s_area), 3, 3);
+    // The area's natural context: GLES 2.0 (on some GPUs — e.g. NVIDIA — an
+    // on-screen 3D context that is not GLESv2 flickers). The blit pipeline
+    // is GLES2-core (VAO/VBO, one oversized triangle, a 1:1 texture copy).
+    gtk_gl_area_set_allowed_apis(GTK_GL_AREA(s_area), GDK_GL_API_GLES);
+    gtk_gl_area_set_required_version(GTK_GL_AREA(s_area), 2, 0);
     gtk_widget_set_focusable(s_area, TRUE);
     g_signal_connect(s_area, "render", G_CALLBACK(onRender), nullptr);
     gtk_window_set_child(GTK_WINDOW(s_win), s_area);
@@ -609,34 +536,26 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     // The continuous frame pump (see framePumpTick).
     g_timeout_add(16, framePumpTick, nullptr);
 
-    const int scale = gtk_widget_get_scale_factor(s_area);
-    const uint32_t devW = (uint32_t)gtk_widget_get_width(s_area) * (uint32_t)scale;
-    const uint32_t devH = (uint32_t)gtk_widget_get_height(s_area) * (uint32_t)scale;
-    if (!setupGL(devW, devH)) {
+    if (!setupGL()) {
         GError* gerr = nullptr;
         g_set_error(&gerr, GDK_GL_ERROR, GDK_GL_ERROR_NOT_AVAILABLE,
-                    "EGL context pair setup failed");
+                    "EGL setup failed");
         gtk_gl_area_set_error(GTK_GL_AREA(s_area), gerr);
         g_clear_error(&gerr);
     } else {
         // Kick the frame loop: the first "render" may have fired before the
-        // GL pair was ready (and returned early), so invalidate once more.
+        // GL setup was ready (and returned early), so invalidate once more.
         gtk_widget_queue_draw(s_area);
     }
 
     s_uiWindow.nwhType = UI_NWH_DEFAULT;
     s_uiWindow.nwh = nullptr;
     s_uiWindow.ndt = nullptr;
-    s_uiWindow.offscreen = 1;  // the renderer renders into the shared scene texture
-    s_uiWindow.eglDisplay     = s_gl.ready ? (void*)s_gl.display  : nullptr;
-    s_uiWindow.eglContext     = s_gl.ready ? (void*)s_gl.bgfxCtx  : nullptr;
-    s_uiWindow.eglPbuffer     = s_gl.ready ? (void*)s_gl.pbuffer  : nullptr;
-    s_uiWindow.eglAreaSurface = s_gl.ready ? (void*)s_gl.areaSurf : nullptr;
-    s_uiWindow.sceneTex       = s_gl.ready ? s_gl.sceneTex : 0;
+    s_uiWindow.offscreen = 1;  // the renderer renders offscreen (bgfx, Vulkan)
     if (getenv("TETRIS_EGL_DEBUG"))
-        fprintf(stderr, "[dbg] ready=%d display=%p ctx=%p pbuf=%p areaSurf=%p sceneTex=%u\n",
-                (int)s_gl.ready, s_uiWindow.eglDisplay, s_uiWindow.eglContext,
-                s_uiWindow.eglPbuffer, s_uiWindow.eglAreaSurface, s_uiWindow.sceneTex);
+        fprintf(stderr, "[dbg] ready=%d display=%p ctx=%p sceneTex=%u\n",
+                (int)s_gl.ready, (void*)s_gl.display, (void*)s_gl.areaCtx,
+                (unsigned)s_gl.sceneTex);
     return &s_uiWindow;
 }
 
@@ -675,6 +594,24 @@ int uiWindowReadBackbuffer(uint32_t w, uint32_t h, void* out, uint32_t outSize) 
     return -1;
 }
 
+// Linux GL area path: the renderer calls this from the frame driver (inside
+// this layer's render callback — same thread, no lock) to hand over the
+// frame just rendered as a dma-buf. The fd is consumed by the next import
+// attempt in onRender: on success the EGLImage owns it (closed when the
+// image is destroyed), on failure it is closed there.
+void uiWindowSetFrameImage(int32_t fd, uint64_t modifier, uint32_t pitch) {
+    if (fd < 0) return;
+    // Defensive: a pending fd would mean a previous import never consumed it
+    // (an early-returned frame) — close it so it cannot leak.
+    if (s_frame.valid && s_frame.fd >= 0) {
+        ::close(s_frame.fd);
+    }
+    s_frame.fd = fd;
+    s_frame.modifier = modifier;
+    s_frame.pitch = pitch;
+    s_frame.valid = true;
+}
+
 int uiShouldQuit(void) {
     return s_quit ? 1 : 0;
 }
@@ -700,8 +637,14 @@ void uiWindowSize(uint32_t* w, uint32_t* h) {
 
 void uiShutdown(void) {
     if (s_gl.ready) {
-        // C1 current for the objects it owns (scene texture, blit pipeline).
-        eglMakeCurrent(s_gl.display, s_gl.areaSurf, s_gl.areaSurf, s_gl.areaCtx);
+        // C1 current for the objects it owns (scene texture, blit pipeline,
+        // the imported frame image).
+        if (eglGetCurrentContext() != s_gl.areaCtx)
+            eglMakeCurrent(s_gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, s_gl.areaCtx);
+        if (s_gl.currentImage != EGL_NO_IMAGE) {
+            eglDestroyImage(s_gl.display, s_gl.currentImage);
+            s_gl.currentImage = EGL_NO_IMAGE;
+        }
         if (s_gl.sceneTex != 0) {
             glDeleteTextures(1, &s_gl.sceneTex);
             s_gl.sceneTex = 0;
@@ -709,17 +652,6 @@ void uiShutdown(void) {
         if (s_gl.blitProg != 0) glDeleteProgram(s_gl.blitProg);
         if (s_gl.blitVbo != 0) glDeleteBuffers(1, &s_gl.blitVbo);
         if (s_gl.blitVao != 0) glDeleteVertexArrays(1, &s_gl.blitVao);
-        // Release and destroy C2 (it must go away before the window destroy
-        // releases C1, the context it shares with).
-        eglMakeCurrent(s_gl.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (s_gl.bgfxCtx != EGL_NO_CONTEXT) {
-            eglDestroyContext(s_gl.display, s_gl.bgfxCtx);
-            s_gl.bgfxCtx = EGL_NO_CONTEXT;
-        }
-        if (s_gl.pbuffer != EGL_NO_SURFACE) {
-            eglDestroySurface(s_gl.display, s_gl.pbuffer);
-            s_gl.pbuffer = EGL_NO_SURFACE;
-        }
         s_gl.ready = false;
     }
     if (s_win != nullptr) {

@@ -1,5 +1,7 @@
-/build
+/build-debug
+/build-release
 /tetris_high.txt
 /tetris_shot.bmp
 .DS_Store
 .idea
+.openidea

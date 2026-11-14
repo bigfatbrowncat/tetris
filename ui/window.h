@@ -29,34 +29,16 @@ typedef struct {
 	void*    nwh;
 	void*    ndt;      // native display: X11 Display* / Wayland wl_display* (or NULL)
 	// 1: the renderer renders offscreen: on Linux (the GTK GL area path,
-	//    X11 + Wayland) into a shared GL texture that the UI layer presents
-	//    as a full-frame quad (GPU to GPU, no CPU copy, nwh/ndt unused); on
-	//    Windows into the UI layer's full-window D3D11 scene texture
-	//    (context/backBuffer below), which the UI layer blits to the
-	//    composition swap chain's back buffer and presents through
-	//    DirectComposition. 0: the renderer presents to nwh directly (macOS).
+	//    X11 + Wayland) into a headless-Vulkan bgfx texture that the UI
+	//    layer imports per frame (dma-buf, see uiWindowSetFrameImage) and
+	//    blits 1:1 as a full-frame quad in the GL area's native GLES2
+	//    context (GPU to GPU, only the texture crosses the Vulkan/GL
+	//    boundary, nwh/ndt unused); on Windows into the UI layer's
+	//    full-window D3D11 scene texture (context/backBuffer below), which
+	//    the UI layer blits to the composition swap chain's back buffer and
+	//    presents through DirectComposition. 0: the renderer presents to
+	//    nwh directly (macOS).
 	uint32_t offscreen;
-	// GTK GL area path only (offscreen == 1); all values are EGL types:
-	//   eglDisplay      — the EGLDisplay everything shares.
-	//   eglContext      — the EGL context bgfx adopts (bgfx::Init.platformData
-	//                     .context); shares the GL area's context and is
-	//                     current (surfaceless, or on a 1x1 pbuffer).
-	//   eglPbuffer      — the surface C2 is current on (never presented);
-	//                     NULL when the context is surfaceless.
-	//   eglAreaSurface  — the GL area context's window surface (NULL when the
-	//                     context is surfaceless, e.g. on Wayland; the UI
-	//                     layer re-binds the context surfaceless before
-	//                     presenting the quad).
-	//   sceneTex        — GL texture name (RGBA8) the renderer draws the scene
-	//                     into; owned by the UI layer, kept at the window's
-	//                     device-pixel size, visible in every context of the
-	//                     share group.
-	// NULL / 0 on other platforms.
-	void*    eglDisplay;
-	void*    eglContext;
-	void*    eglPbuffer;
-	void*    eglAreaSurface;
-	uint32_t sceneTex;
 	// Windows composition path only (offscreen == 1); all D3D11 types:
 	//   context    — the ID3D11Device* bgfx adopts (platformData.context);
 	//                bgfx AddRefs it, the UI layer owns the base reference.
@@ -127,6 +109,17 @@ void uiSetFrameDriver(UiFrameDriver cb, void* userData);
 // bgfx::setPlatformData(), or NULL on failure. Called by the renderer on a
 // size change, on the UI thread. No-op on other platforms (returns NULL).
 void* uiWindowResize(uint32_t w, uint32_t h);
+
+// Linux GL area path only (offscreen == 1): the renderer calls this after
+// rendering a frame (same thread, right before the GL area's "render"
+// callback runs — no locking). It hands over the frame as a dma-buf: `fd`
+// is the imported file descriptor (RGBA8, `pitch` bytes per row, `modifier`
+// the tiling modifier; the UI layer owns `fd` from this call and closes it
+// after importing, or immediately if the import fails). The UI layer imports
+// it into the GL area's GLES2 context and blits it 1:1; if the call is
+// skipped or the import fails, the UI layer keeps blitting the previous
+// frame. No-op on other platforms.
+void uiWindowSetFrameImage(int32_t fd, uint64_t modifier, uint32_t pitch);
 
 // Windows composition path only: read the full-window scene texture (the
 // frame bgfx just rendered; the blit copies it 1:1 to the swap chain's back

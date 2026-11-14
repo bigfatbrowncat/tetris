@@ -1,16 +1,17 @@
 // ============================================================================
 //  Renderer — bgfx rendering of a TetrisBackend::Snapshot.
-//  (Metal on macOS; the OpenGL/EGL backend on Linux.)
+//  (Metal on macOS; headless Vulkan on Linux; Direct3D 11 on Windows.)
 //  ---------------------------------------------------------------------------
 //  Single dynamic vertex buffer, one draw call per frame. All drawing is
 //  derived from the Snapshot — this class knows nothing about game rules.
 //
-//  On Linux the renderer runs single-threaded and offscreen: it renders the
-//  scene into a GL texture that the UI layer owns (UiWindow.sceneTex) and
-//  presents as a full-frame quad in a GtkGLArea — GPU to GPU, no CPU copy.
-//  bgfx adopts the UI layer's shared EGL context (Init.platformData.context)
-//  and the scene texture is swapped in with bgfx::overrideInternal(), so
-//  bgfx renders straight into it and never deletes it.
+//  On Linux the renderer runs single-threaded and offscreen: bgfx (Vulkan
+//  backend) renders the scene into an app-created texture that is exactly
+//  the window's device-pixel size (recreated on resize). Each frame the
+//  texture's memory is exported as a dma-buf (bgfx::getTextureDmaBuf) and
+//  handed to the UI layer (uiWindowSetFrameImage), which imports it into
+//  the GTK GL area's native GLES2 context and blits it 1:1 — GPU to GPU,
+//  only the texture crosses the Vulkan/GL boundary.
 //
 //  Threading (Linux): created and driven from the UI thread only. Because
 //  bgfx::renderFrame() is latched before bgfx::init() (from that same
@@ -35,7 +36,7 @@ public:
     Renderer& operator=(const Renderer&) = delete;
 
     // Initialize bgfx on the given native window data (handle + platform
-    // type, or the shared EGL texture pair on the Linux GL area path).
+    // type; offscreen flag on the Linux and Windows composition paths).
     bool init(const UiWindow* win);
 
     // Destroy resources and shut bgfx down.
@@ -46,14 +47,14 @@ public:
     // whatever the previous frame left in it).
     bool render(const TetrisBackend::Snapshot& s, uint32_t pixelW, uint32_t pixelH);
 
-    // End the frame (bgfx::frame; on Linux the scene texture write is
-    // flushed with glFinish() before returning).
+    // End the frame (bgfx::frame; on Linux the rendered frame is then
+    // exported as a dma-buf and handed to the UI layer).
     void endFrame();
 
     // Block until the frame submitted by the preceding endFrame() has been
     // presented to the native surface. Issues the extra bgfx::frame() calls
     // that bgfx's pipeline needs before that present is guaranteed.
-    // No-op on the Linux GL area path (the UI layer's blit is the present).
+    // No-op on the Linux offscreen path (the UI layer's blit is the present).
     void syncPresent();
 
     // Ask bgfx to write a screenshot (delivered via the CallbackI::screenShot).

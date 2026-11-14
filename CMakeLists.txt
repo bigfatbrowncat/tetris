@@ -1,7 +1,8 @@
 # ============================================================================
 #  Tetris — cross-platform (bgfx)
 #    macOS  : Metal + Cocoa
-#    Linux  : OpenGL/EGL + GTK4
+#    Linux  : Vulkan (offscreen bgfx, frames handed over as dma-bufs) + GTK4
+#             (a GL area whose GLES2 context imports each frame and blits it)
 #    Windows: Direct3D 11 + DirectComposition (a never-flickering resizable
 #             window, ported from the noflicker_directx_window POC)
 #  ---------------------------------------------------------------------------
@@ -106,8 +107,11 @@ else()
     pkg_check_modules(GTK4 REQUIRED IMPORTED_TARGET gtk4)
     pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
     pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+    pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
     set(UI_SOURCES gtk/window.cpp)
-    set(UI_LINK PkgConfig::GTK4 PkgConfig::EPOXY PkgConfig::EGL)
+    # libdrm: drm_fourcc.h (DRM_FORMAT_ABGR8888 — the fourcc of the dma-buf
+    # the renderer exports each frame).
+    set(UI_LINK PkgConfig::GTK4 PkgConfig::EPOXY PkgConfig::EGL PkgConfig::LIBDRM)
 endif()
 set(PLATFORM_SHADERS_INC ${GEN_SHADERS})
 
@@ -142,11 +146,12 @@ elseif(WIN32)
         tetrisback
         bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
 else()
+    # The Linux renderer is bgfx (Vulkan backend, headless/offscreen); the
+    # frontend no longer touches GL/EGL directly (the UI module owns the
+    # GLES2 blit + the dma-buf import).
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
-        bgfxRelease bimgRelease bxRelease    # resolved via the link dir below
-        PkgConfig::EPOXY                     # the shared-context blit/flush (glFinish)
-        PkgConfig::EGL)                      # bgfx adopts the UI layer's EGL context
+        bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
 endif()
 target_link_directories(tetrisfront PUBLIC ${TP_BIN})
 add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)
@@ -170,6 +175,7 @@ add_custom_command(
             ${GEN_SHADERS}/shaders ${TP_BIN}/shadercRelease${CMAKE_EXECUTABLE_SUFFIX} ${BGFX_ROOT}
     DEPENDS ${CMAKE_SOURCE_DIR}/shaders/vs_quad.sc
             ${CMAKE_SOURCE_DIR}/shaders/fs_quad.sc
+            ${CMAKE_SOURCE_DIR}/scripts/build_shaders.py
             tp_shaderc
     COMMENT "[shaders] building vs_quad/fs_quad"
     VERBATIM)
