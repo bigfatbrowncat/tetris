@@ -326,9 +326,9 @@ static bool setupGL(void) {
 // C1 is current. Imports the dma-buf (fd, modifier, pitch — RGBA8, w x h)
 // as an EGLImage. DRM_FORMAT_ABGR8888: the fourcc names list the channels
 // MSB to LSB, so the little-endian memory layout is [R, G, B, A] —
-// byte-identical to the renderer's VK_FORMAT_R8G8B8A8_UNORM image. On
-// success the image owns the fd (closed when the image is destroyed); on
-// failure the caller still owns it and must close it.
+// byte-identical to the renderer's VK_FORMAT_R8G8B8A8_UNORM image. The
+// caller keeps ownership of the fd in both outcomes (the image pins the GEM
+// object by handle, not the fd) and must close it after this returns.
 static EGLImage importDmaBuf(int32_t fd, uint64_t modifier, uint32_t pitch,
                              uint32_t w, uint32_t h) {
     const EGLAttrib attrs[] = {
@@ -367,8 +367,9 @@ static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) 
     //    be destroyed and the texture re-targeted.
     glFinish();
 
-    // 2) The previous frame's image is no longer read — destroy it (it owns
-    //    the dma-buf fd, which the driver closes on destruction).
+    // 2) The previous frame's image is no longer read — destroy it. (The
+    //    dma-buf fd was already closed at import; the image holds only a
+    //    GEM-handle reference to the buffer.)
     if (s_gl.currentImage != EGL_NO_IMAGE) {
         eglDestroyImage(s_gl.display, s_gl.currentImage);
         s_gl.currentImage = EGL_NO_IMAGE;
@@ -390,18 +391,24 @@ static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) 
     //    On import failure close the fd and keep the previous frame's image
     //    (the blit below re-copies it — no flicker).
     if (s_frame.valid) {
-        EGLImage img = importDmaBuf(s_frame.fd, s_frame.modifier, s_frame.pitch, w, h);
         const int32_t fd = s_frame.fd;
+        const uint64_t modifier = s_frame.modifier;
+        const uint32_t pitch = s_frame.pitch;
         s_frame.valid = false;
+        EGLImage img = importDmaBuf(fd, modifier, pitch, w, h);
+        // Per EGL_EXT_image_dma_buf_import the client keeps ownership of the
+        // dma-buf fd across eglCreateImage — the image pins the GEM object by
+        // handle, not the fd — so close it here on both outcomes. Skipping
+        // this on success leaked one fd every frame.
+        ::close(fd);
         if (img != EGL_NO_IMAGE) {
             glBindTexture(GL_TEXTURE_2D, s_gl.sceneTex);
             glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)img);
             glBindTexture(GL_TEXTURE_2D, 0);
-            s_gl.currentImage = img;  // the image owns the fd now
+            s_gl.currentImage = img;
         } else {
             fprintf(stderr, "[window] dma-buf import failed (error 0x%x); keeping the previous frame\n",
                     eglGetError());
-            ::close(fd);
         }
     }
 
@@ -597,8 +604,8 @@ int uiWindowReadBackbuffer(uint32_t w, uint32_t h, void* out, uint32_t outSize) 
 // Linux GL area path: the renderer calls this from the frame driver (inside
 // this layer's render callback — same thread, no lock) to hand over the
 // frame just rendered as a dma-buf. The fd is consumed by the next import
-// attempt in onRender: on success the EGLImage owns it (closed when the
-// image is destroyed), on failure it is closed there.
+// in onRender and closed there (the client keeps ownership across
+// eglCreateImage in both outcomes).
 void uiWindowSetFrameImage(int32_t fd, uint64_t modifier, uint32_t pitch) {
     if (fd < 0) return;
     // Defensive: a pending fd would mean a previous import never consumed it

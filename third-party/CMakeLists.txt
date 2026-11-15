@@ -141,12 +141,25 @@ else()
     # shared output files — and CMake's Makefile generator duplicates this
     # rule into each dependent target's sub-make, so parallel builds would
     # race.
+    #
+    # The rule must re-run when the bgfx tree is reset to a pristine upstream
+    # checkout (git submodule update), because tp_build.sh then has to (re)apply
+    # the local patch before building. Depend on the patch itself (mtime moves
+    # when it is edited) and on a bgfx header (mtime moves on every checkout).
+    set(TP_DEPS "${TP_PROJGEN_OUTPUT}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tp_build.sh"
+                "${BGFX_ROOT}/include/bgfx/bgfx.h")
+    # Patches live in the superproject (third-party/patches/<component>/),
+    # outside the submodules, so a fresh clone carries them.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/bgfx/0000-dma-buf-texture-export.patch")
+        list(APPEND TP_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/patches/bgfx/0000-dma-buf-texture-export.patch")
+    endif()
     add_custom_command(
         OUTPUT ${TP_ARTIFACTS}
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tp_build.sh"
                 "${CMAKE_CURRENT_BINARY_DIR}/tp-make.lock"
                 "${TP_PROJ}" "${TP_CFG}" bx bimg bgfx shaderc
-        DEPENDS "${TP_PROJGEN_OUTPUT}"
+        DEPENDS ${TP_DEPS}
         COMMENT "[tp] building bx bimg bgfx shaderc"
         VERBATIM)
 endif()

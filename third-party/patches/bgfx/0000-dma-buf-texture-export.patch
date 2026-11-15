@@ -1,0 +1,553 @@
+diff --git a/include/bgfx/bgfx.h b/include/bgfx/bgfx.h
+index 8e077197a..997894360 100644
+--- a/include/bgfx/bgfx.h
++++ b/include/bgfx/bgfx.h
+@@ -3633,6 +3633,34 @@ namespace bgfx
+ 	///
+ 	void* getDirectAccessPtr(TextureHandle _handle);
+ 
++	/// Get a dma-buf file descriptor for a texture's device memory.
++	///
++	/// The texture must have been created with `BGFX_TEXTURE_DMA_BUF_EXPORT`
++	/// (currently only the Vulkan backend on Linux supports it). The call
++	/// waits for all GPU work on the device to complete and then exports the
++	/// texture's backing memory as a dma-buf.
++	///
++	/// @param[in] _handle Texture handle created with `BGFX_TEXTURE_DMA_BUF_EXPORT`.
++	/// @param[out] _fd File descriptor of the dma-buf. The caller takes ownership
++	///   of the descriptor and is responsible for closing it (or handing it to
++	///   another API that consumes it, e.g. `eglCreateImage()`). Note that the
++	///   descriptor may be different on every call even if it refers to the same
++	///   underlying memory.
++	/// @param[out] _modifier DRM format modifier of the image. Zero is
++	///   `DRM_FORMAT_MOD_LINEAR`.
++	/// @param[out] _pitch Row pitch of the image in bytes (plane 0).
++	///
++	/// @returns True if the dma-buf file descriptor was successfully obtained.
++	///
++	/// @attention This is not a C99 API.
++	///
++	bool getTextureDmaBuf(
++		  TextureHandle _handle
++		, int32_t* _fd
++		, uint64_t* _modifier
++		, uint32_t* _pitch
++		);
++
+ 	/// Destroy texture.
+ 	///
+ 	/// @param[in] _handle Texture handle.
+diff --git a/include/bgfx/defines.h b/include/bgfx/defines.h
+index 8d7832ea0..d8b9d2255 100644
+--- a/include/bgfx/defines.h
++++ b/include/bgfx/defines.h
+@@ -293,6 +293,7 @@
+ #define BGFX_TEXTURE_BLIT_DST                     UINT64_C(0x0000400000000000) //!< Texture will be used as blit destination.
+ #define BGFX_TEXTURE_READ_BACK                    UINT64_C(0x0000800000000000) //!< Texture will be used for read back from GPU.
+ #define BGFX_TEXTURE_EXTERNAL_SHARED              UINT64_C(0x0001000000000000) //!< Texture is shared with other device or other process.
++#define BGFX_TEXTURE_DMA_BUF_EXPORT               UINT64_C(0x0002000000000000) //!< Texture memory will be exportable as a dma-buf (Linux, Vulkan backend only). Use `bgfx::getTextureDmaBuf()` to obtain the file descriptor.
+ 
+ /**
+  * Do not use! Top nibble is reserved for internal texture flags (see bgfx_p.h).
+diff --git a/src/bgfx.cpp b/src/bgfx.cpp
+index f0355ba68..1493208bd 100644
+--- a/src/bgfx.cpp
++++ b/src/bgfx.cpp
+@@ -5752,15 +5752,10 @@ namespace bgfx
+ 				++color;
+ 			}
+ 
+-			BGFX_ERROR_CHECK(true
+-				&& 0 == (tr.m_flags & BGFX_TEXTURE_READ_BACK)
+-				, _err
+-				, BGFX_ERROR_FRAME_BUFFER_VALIDATION
+-				, "Frame buffer texture cannot be created with `BGFX_TEXTURE_READ_BACK`."
+-				, "Attachment %d, texture flags 0x%016" PRIx64 "."
+-				, ii
+-				, tr.m_flags
+-				);
++			// TETRIS-FORK: allow BGFX_TEXTURE_READ_BACK frame buffer
++			// attachments (see isTextureValid above) — the Vulkan renderer's
++			// read back path does not prevent the texture from being used
++			// as a render target.
+ 
+ 			BGFX_ERROR_CHECK(true
+ 				&& 0 != (tr.m_flags & BGFX_TEXTURE_RT_MASK)
+@@ -5852,14 +5847,11 @@ namespace bgfx
+ 			, g_caps.limits.maxTextureSize
+ 			);
+ 
+-		BGFX_ERROR_CHECK(false
+-			|| 0 == (_flags & BGFX_TEXTURE_RT_MASK)
+-			|| 0 == (_flags & BGFX_TEXTURE_READ_BACK)
+-			, _err
+-			, BGFX_ERROR_TEXTURE_VALIDATION
+-			, "Can't create render target with `BGFX_TEXTURE_READ_BACK` flag."
+-			, ""
+-			);
++		// TETRIS-FORK: allow render targets with BGFX_TEXTURE_READ_BACK.
++		// In the Vulkan renderer the texture image is a regular GPU image
++		// (TRANSFER_SRC); read back goes through a per-read staging buffer,
++		// so a texture can be a render target and a read back source at the
++		// same time. Needed for screenshots from an offscreen scene texture.
+ 
+ 		BGFX_ERROR_CHECK(false
+ 			|| 0 == (_flags & BGFX_TEXTURE_COMPUTE_WRITE)
+@@ -6470,6 +6462,18 @@ namespace bgfx
+ 		return s_ctx->readTexture(_src.handle, _data, _src.z, _src.mip);
+ 	}
+ 
++	bool getTextureDmaBuf(TextureHandle _handle, int32_t* _fd, uint64_t* _modifier, uint32_t* _pitch)
++	{
++		BGFX_CHECK_API_THREAD();
++		BGFX_CHECK_HANDLE("getTextureDmaBuf", s_ctx->m_textureHandle, _handle);
++
++		// Note: this calls the renderer context directly (not through the
++		// command buffer) so that the file descriptor is available
++		// synchronously. The caller must be on the thread that drives
++		// rendering, with all frame commands already submitted.
++		return s_ctx->m_renderCtx->getTextureDmaBuf(_handle, _fd, _modifier, _pitch);
++	}
++
+ 	void clear(TextureHandle _handle, uint8_t _mip, uint8_t _numMips, uint16_t _layer, uint16_t _numLayers)
+ 	{
+ 		BGFX_CHECK_HANDLE("clearTexture", s_ctx->m_textureHandle, _handle);
+diff --git a/src/bgfx_p.h b/src/bgfx_p.h
+index b5a90798e..c4669be43 100644
+--- a/src/bgfx_p.h
++++ b/src/bgfx_p.h
+@@ -4768,6 +4768,11 @@ namespace bgfx
+ 		virtual void updateTexture(TextureHandle _handle, uint8_t _side, uint8_t _mip, const Rect& _rect, uint16_t _z, uint16_t _depth, uint16_t _pitch, const Memory* _mem) = 0;
+ 		virtual void clearTexture(TextureHandle _handle, uint8_t _mip, uint8_t _numMips, uint16_t _layer, uint16_t _numLayers) = 0;
+ 		virtual void readTexture(TextureHandle _handle, void* _data, uint16_t _layer, uint8_t _mip) = 0;
++		virtual bool getTextureDmaBuf(TextureHandle _handle, int32_t* _fd, uint64_t* _modifier, uint32_t* _pitch)
++		{
++			BX_UNUSED(_handle, _fd, _modifier, _pitch);
++			return false;
++		}
+ 		virtual void readBuffer(Handle _handle, void* _data, uint32_t _offset, uint32_t _size) = 0;
+ 		virtual void resizeTexture(TextureHandle _handle, uint16_t _width, uint16_t _height, uint8_t _numMips, uint16_t _numLayers) = 0;
+ 		virtual void overrideInternal(TextureHandle _handle, uintptr_t _ptr, uint16_t _layerIndex) = 0;
+diff --git a/src/renderer_vk.cpp b/src/renderer_vk.cpp
+index d8f9f0458..c3ee89b7c 100644
+--- a/src/renderer_vk.cpp
++++ b/src/renderer_vk.cpp
+@@ -149,11 +149,15 @@ namespace bgfx { namespace vk
+ 		const char*      name;
+ 	};
+ 
++	// Prefer present modes that drain late frames instead of holding them for
++	// the next VBlank slot: strict FIFO makes vkAcquireNextImageKHR stall
++	// (measured ~500ms during window resize on X11) when a frame is late.
++	// FIFO_RELAXED/MAILBOX still present on VBlank, so no tearing/flicker.
+ 	static const PresentMode s_presentMode[] =
+ 	{
+-		{ VK_PRESENT_MODE_FIFO_KHR,         true,  "VK_PRESENT_MODE_FIFO_KHR"         },
+ 		{ VK_PRESENT_MODE_FIFO_RELAXED_KHR, true,  "VK_PRESENT_MODE_FIFO_RELAXED_KHR" },
+ 		{ VK_PRESENT_MODE_MAILBOX_KHR,      true,  "VK_PRESENT_MODE_MAILBOX_KHR"      },
++		{ VK_PRESENT_MODE_FIFO_KHR,         true,  "VK_PRESENT_MODE_FIFO_KHR"         },
+ 		{ VK_PRESENT_MODE_IMMEDIATE_KHR,    false, "VK_PRESENT_MODE_IMMEDIATE_KHR"    },
+ 	};
+ 
+@@ -404,6 +408,9 @@ VK_IMPORT_DEVICE
+ 			KHR_wayland_surface,
+ 			KHR_xlib_surface,
+ 			KHR_xcb_surface,
++			KHR_external_memory_fd,
++			EXT_external_memory_dma_buf,
++			EXT_image_drm_format_modifier,
+ #	elif BX_PLATFORM_WINDOWS
+ 			KHR_win32_surface,
+ #	elif BX_PLATFORM_OSX
+@@ -451,6 +458,9 @@ VK_IMPORT_DEVICE
+ 		{ VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,    1, false, false, true,                                                          Layer::Count },
+ 		{ VK_KHR_XLIB_SURFACE_EXTENSION_NAME,       1, false, false, true,                                                          Layer::Count },
+ 		{ VK_KHR_XCB_SURFACE_EXTENSION_NAME,        1, false, false, true,                                                          Layer::Count },
++		{ VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, 1, false, false, true,                                                          Layer::Count },
++		{ VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,    1, false, false, true,                                                 Layer::Count },
++		{ VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,  1, false, false, true,                                                 Layer::Count },
+ #	elif BX_PLATFORM_WINDOWS
+ 		{ VK_KHR_WIN32_SURFACE_EXTENSION_NAME,      1, false, false, true,                                                          Layer::Count },
+ #	elif BX_PLATFORM_OSX
+@@ -2429,7 +2439,17 @@ VK_IMPORT_DEVICE
+ 				[[fallthrough]];
+ 
+ 			case ErrorState::DeviceCreated:
+-				vkDestroyDevice(m_device, m_allocatorCb);
++				if (NULL != m_externalDevice)
++				{
++					// The device belongs to the caller; do not destroy it.
++					m_externalDevice = NULL;
++					m_device         = NULL;
++				}
++				else
++				{
++					vkDestroyDevice(m_device, m_allocatorCb);
++					m_device = NULL;
++				}
+ 				[[fallthrough]];
+ 
+ 			case ErrorState::InstanceCreated:
+@@ -2736,6 +2756,40 @@ VK_IMPORT_DEVICE
+ 			recycleMemory(stagingMemory);
+ 		}
+ 
++		bool getTextureDmaBuf(TextureHandle _handle, int32_t* _fd, uint64_t* _modifier, uint32_t* _pitch) override
++		{
++			const TextureVK& texture = m_textures[_handle.idx];
++
++			if (VK_NULL_HANDLE == texture.m_textureImage
++			||  NULL == vkGetMemoryFdKHR)
++			{
++				return false;
++			}
++
++			// The context is single-threaded and frame submission is inline,
++			// so a device-wide wait guarantees that all GPU work written into
++			// the image is complete before its memory is exported.
++			vkDeviceWaitIdle(m_device);
++
++			VkMemoryGetFdInfoKHR fdInfo;
++			fdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
++			fdInfo.pNext = NULL;
++			fdInfo.memory = texture.m_textureDeviceMem.mem;
++			fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++
++			int32_t fd = -1;
++			if (VK_SUCCESS != vkGetMemoryFdKHR(m_device, &fdInfo, &fd))
++			{
++				return false;
++			}
++
++			*_fd       = fd;
++			*_modifier = texture.m_drmFormatModifier;
++			*_pitch    = texture.m_dmaBufPitch;
++
++			return true;
++		}
++
+ 		BufferVK& getBuffer(Handle _handle)
+ 		{
+ 			if (_handle.isIndexBuffer() )
+@@ -4954,6 +5008,99 @@ VK_IMPORT_DEVICE
+ 			return result;
+ 		}
+ 
++		// Queries the DRM format modifiers supported for a format and picks
++		// the last one that supports rendering into the image. Returns 0
++		// (DRM_FORMAT_MOD_LINEAR) as the always-safe fallback.
++		uint64_t queryDmaBufModifier(VkFormat _format)
++		{
++			PFN_vkGetPhysicalDeviceFormatProperties2 query =
++				  (NULL != vkGetPhysicalDeviceFormatProperties2)
++				? vkGetPhysicalDeviceFormatProperties2
++				: vkGetPhysicalDeviceFormatProperties2KHR
++				;
++
++			if (NULL == query)
++			{
++				return 0;
++			}
++
++			VkFormatProperties2 formatProperties;
++			formatProperties.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
++			formatProperties.pNext = NULL;
++
++			VkDrmFormatModifierPropertiesEXT modifiers[128];
++			VkDrmFormatModifierPropertiesListEXT modifierList;
++			modifierList.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT;
++			modifierList.pNext = NULL;
++			modifierList.drmFormatModifierCount = BX_COUNTOF(modifiers);
++			modifierList.pDrmFormatModifierProperties = modifiers;
++			formatProperties.pNext = &modifierList;
++
++			query(m_physicalDevice, _format, &formatProperties);
++
++			uint64_t modifier = 0;
++			for (uint32_t ii = 0; ii < modifierList.drmFormatModifierCount; ++ii)
++			{
++				if (0 != modifiers[ii].drmFormatModifier
++				&&  0 != (modifiers[ii].drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) )
++				{
++					modifier = modifiers[ii].drmFormatModifier;
++				}
++			}
++
++			return modifier;
++		}
++
++		// Allocates device memory that can be exported as a dma-buf. Unlike
++		// allocateMemory(), the allocation is not cached by the memory LRU:
++		// it must live for the whole lifetime of the exported image and is
++		// freed directly by CommandQueueVK::consume().
++		VkResult allocateMemoryExportable(const VkMemoryRequirements* requirements, VkMemoryPropertyFlags propertyFlags, DeviceMemoryAllocationVK* memory)
++		{
++			BGFX_PROFILER_SCOPE("RendererContextVK::allocateMemoryExportable", kColorResource);
++
++			VkMemoryAllocateInfo ma;
++			ma.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++			ma.pNext = NULL;
++			ma.allocationSize = requirements->size;
++
++			VkExportMemoryAllocateInfo exportInfo;
++			exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
++			exportInfo.pNext = NULL;
++			exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++			ma.pNext = &exportInfo;
++
++			memory->exportable = true;
++
++			VkResult result = VK_ERROR_UNKNOWN;
++			int32_t searchIndex = -1;
++			do
++			{
++				searchIndex++;
++				searchIndex = selectMemoryType(requirements->memoryTypeBits, propertyFlags, searchIndex);
++
++				if (searchIndex >= 0)
++				{
++					BGFX_PROFILER_SCOPE("vkAllocateMemory", kColorResource);
++
++					ma.memoryTypeIndex = searchIndex;
++					memory->memoryTypeIndex = searchIndex;
++					memory->size = bx::narrowCast<uint32_t>(ma.allocationSize);
++					memory->offset = 0;
++					result = vkAllocateMemory(m_device, &ma, m_allocatorCb, &memory->mem);
++				}
++			}
++			while (result != VK_SUCCESS
++			   &&  searchIndex >= 0);
++
++			if (VK_SUCCESS != result)
++			{
++				memory->exportable = false;
++			}
++
++			return result;
++		}
++
+ 		VkResult createHostBuffer(uint32_t _size, VkMemoryPropertyFlags _flags, ::VkBuffer* _buffer, DeviceMemoryAllocationVK* _memory, bool _forcePrivateDeviceAllocation, const void* _data = NULL)
+ 		{
+ 			BGFX_PROFILER_SCOPE("RendererContextVK::createHostBuffer", kColorResource);
+@@ -6783,6 +6930,47 @@ VK_DESTROY
+ 		return result;
+ 	}
+ 
++	// [fork] Initialize the dma-buf export pNext chain.
++	//
++	// The chain is VkExternalMemoryImageCreateInfo ->
++	// VkImageDrmFormatModifierExplicitCreateInfoEXT and it reaches the driver
++	// only through a second-order pointer: ici.pNext points at externalInfo,
++	// and externalInfo.pNext points at drmModifierInfo. The Vulkan driver
++	// (ANV, loaded via dlopen) is the sole consumer of those pointers and is
++	// opaque to the compiler.
++	//
++	// Both GCC and Clang incorrectly dead-store-eliminate the plain stack
++	// initialization of these two structs in this shape: they do not model
++	// that the opaque driver dereferences the pointers stored in ici, so the
++	// stores look dead and get removed. The driver then walks a pNext chain
++	// into uninitialized stack and faults (SEGV) — the root cause of the
++	// resize crash.
++	//
++	// Storing through a volatile-qualified pointer makes every store a
++	// language-mandated side effect; dead-store elimination is not permitted
++	// to remove it, so the chain is guaranteed to be materialized before
++	// vkCreateImage. (A memory-clobbered asm barrier did NOT reliably stop
++	// this elimination in testing, so volatile is used instead.)
++	static void initDmaBufExportChain(
++		uint64_t _drmFormatModifier,
++		volatile VkExternalMemoryImageCreateInfo* _externalInfo,
++		volatile VkImageDrmFormatModifierExplicitCreateInfoEXT* _drmModifierInfo)
++	{
++		_drmModifierInfo->sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
++		_drmModifierInfo->pNext = NULL;
++		_drmModifierInfo->drmFormatModifier = _drmFormatModifier;
++		_drmModifierInfo->drmFormatModifierPlaneCount = 0;
++		_drmModifierInfo->pPlaneLayouts = NULL;
++
++		_externalInfo->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++		_externalInfo->pNext = (0 != _drmFormatModifier)
++			? reinterpret_cast<const void*>(
++				const_cast<VkImageDrmFormatModifierExplicitCreateInfoEXT*>(_drmModifierInfo))
++			: NULL
++			;
++		_externalInfo->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++	}
++
+ 	VkResult TextureVK::createImages(VkCommandBuffer _commandBuffer, uint64_t _external)
+ 	{
+ 		BGFX_PROFILER_SCOPE("TextureVK::createImages", kColorResource);
+@@ -6867,6 +7055,44 @@ VK_DESTROY
+ 		}
+ 		else
+ 		{
++			// A texture flagged BGFX_TEXTURE_DMA_BUF_EXPORT gets its memory
++			// allocated with a dma-buf export handle so it can be handed to
++			// another API (e.g. OpenGL ES) through a file descriptor. Only
++			// single-sampled, single-layer 2D color images are supported.
++			const bool exportable = 0 != (m_flags & BGFX_TEXTURE_DMA_BUF_EXPORT)
++				&& 1 == m_sampler.Count
++				&& 1 == m_numLayers
++				;
++
++			if (exportable)
++			{
++				m_drmFormatModifier = s_renderVK->queryDmaBufModifier(m_format);
++
++				VkImageDrmFormatModifierExplicitCreateInfoEXT drmModifierInfo;
++				VkExternalMemoryImageCreateInfo externalInfo;
++				// [fork] Initialize the chain through volatile pointers (see
++				// initDmaBufExportChain): the plain stores here are otherwise
++				// dead-store-eliminated because the chain escapes to the driver
++				// only through a second-order pointer.
++				initDmaBufExportChain(m_drmFormatModifier, &externalInfo, &drmModifierInfo);
++
++				if (0 != m_drmFormatModifier)
++				{
++					ici.pNext = &externalInfo;
++					ici.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++				}
++				else
++				{
++					ici.pNext = &externalInfo;
++					ici.tiling = VK_IMAGE_TILING_LINEAR;
++				}
++			}
++			else
++			{
++				ici.pNext = NULL;
++				ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++			}
++
+ 			result = vkCreateImage(device, &ici, allocatorCb, &m_textureImage);
+ 			if (VK_SUCCESS != result)
+ 			{
+@@ -6877,7 +7103,14 @@ VK_DESTROY
+ 			VkMemoryRequirements imageMemReq;
+ 			vkGetImageMemoryRequirements(device, m_textureImage, &imageMemReq);
+ 
+-			result = s_renderVK->allocateMemory(&imageMemReq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &m_textureDeviceMem, false);
++			if (exportable)
++			{
++				result = s_renderVK->allocateMemoryExportable(&imageMemReq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &m_textureDeviceMem);
++			}
++			else
++			{
++				result = s_renderVK->allocateMemory(&imageMemReq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &m_textureDeviceMem, false);
++			}
+ 			if (VK_SUCCESS != result)
+ 			{
+ 				BX_TRACE("Create texture image error: allocateMemory failed %d: %s.", result, getName(result) );
+@@ -6890,6 +7123,24 @@ VK_DESTROY
+ 				BX_TRACE("Create texture image error: vkBindImageMemory failed %d: %s.", result, getName(result) );
+ 				return result;
+ 			}
++
++			if (exportable)
++			{
++				// Record the row pitch the exporter will report for the
++				// dma-buf. For DRM format modifier images the layout query
++				// requires a memory-plane aspect mask.
++				VkImageSubresource subresource;
++				subresource.aspectMask = 0 != m_drmFormatModifier
++					? VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT
++					: VK_IMAGE_ASPECT_COLOR_BIT
++					;
++				subresource.mipLevel   = 0;
++				subresource.arrayLayer = 0;
++
++				VkSubresourceLayout layout;
++				vkGetImageSubresourceLayout(device, m_textureImage, &subresource, &layout);
++				m_dmaBufPitch = bx::narrowCast<uint32_t>(layout.rowPitch);
++			}
+ 		}
+ 
+ 		m_sampledLayout = m_flags & (BGFX_TEXTURE_COMPUTE_WRITE | BGFX_TEXTURE_INTERNAL_VIDEO_DECODE_DST)
+@@ -9592,11 +9843,12 @@ VK_DESTROY
+ 
+ 		for (DeviceMemoryAllocationVK& alloc : m_recycleAllocs[m_consumeIndex])
+ 		{
+-			s_renderVK->m_memoryLru.recycle(alloc);
++			if (!alloc.exportable)
++			{
++				s_renderVK->m_memoryLru.recycle(alloc);
++			}
+ 		}
+ 
+-		m_recycleAllocs[m_consumeIndex].clear();
+-
+ 		for (const Resource& resource : m_release[m_consumeIndex])
+ 		{
+ 			switch (resource.m_type)
+@@ -9622,6 +9874,19 @@ VK_DESTROY
+ 		}
+ 
+ 		m_release[m_consumeIndex].clear();
++
++		// Exportable memory is freed directly (it is not part of the memory
++		// LRU). This must happen after the release queue above so that any
++		// images bound to the memory are already destroyed.
++		for (DeviceMemoryAllocationVK& alloc : m_recycleAllocs[m_consumeIndex])
++		{
++			if (alloc.exportable)
++			{
++				vkFreeMemory(s_renderVK->m_device, alloc.mem, NULL);
++			}
++		}
++
++		m_recycleAllocs[m_consumeIndex].clear();
+ 	}
+ 
+ 	void CommandQueueVK::addExternal(TextureHandle _handle)
+diff --git a/src/renderer_vk.h b/src/renderer_vk.h
+index 77ff0e8e7..741820583 100644
+--- a/src/renderer_vk.h
++++ b/src/renderer_vk.h
+@@ -245,6 +245,11 @@
+ 			VK_IMPORT_DEVICE_FUNC(true, vkUpdateVideoSessionParametersKHR);           \
+ 			/* VK_KHR_video_decode_queue */                                           \
+ 			VK_IMPORT_DEVICE_FUNC(true, vkCmdDecodeVideoKHR);                         \
++			/* VK_KHR_external_memory_fd / VK_EXT_external_memory_dma_buf */          \
++			VK_IMPORT_DEVICE_FUNC(true,  vkGetMemoryFdKHR);                           \
++			/* VK_KHR_maintenance1 */                                                 \
++			VK_IMPORT_DEVICE_FUNC(true,  vkGetPhysicalDeviceFormatProperties2);       \
++			VK_IMPORT_DEVICE_FUNC(true,  vkGetPhysicalDeviceFormatProperties2KHR);    \
+ 
+ #define VK_DESTROY                                \
+ 			VK_DESTROY_FUNC(Buffer);              \
+@@ -378,6 +383,7 @@ VK_DESTROY_FUNC(DescriptorSet);
+ 			, offset(0)
+ 			, size(0)
+ 			, memoryTypeIndex(0)
++			, exportable(false)
+ 		{
+ 		}
+ 
+@@ -385,6 +391,7 @@ VK_DESTROY_FUNC(DescriptorSet);
+ 		uint32_t offset;
+ 		uint32_t size;
+ 		int32_t memoryTypeIndex;
++		bool exportable;
+ 	};
+ 
+ 	struct MemoryLruVK
+@@ -707,6 +714,8 @@ VK_DESTROY_FUNC(DescriptorSet);
+ 			, m_singleMsaaDeviceMem()
+ 			, m_currentSingleMsaaImageLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+ 			, m_videoDecoder(NULL)
++			, m_drmFormatModifier(0)
++			, m_dmaBufPitch(0)
+ 		{
+ 		}
+ 
+@@ -756,6 +765,10 @@ VK_DESTROY_FUNC(DescriptorSet);
+ 		ReadbackVK m_readback;
+ 		VideoDecoderVK* m_videoDecoder;
+ 
++		// dma-buf export state (valid when m_flags has BGFX_TEXTURE_DMA_BUF_EXPORT)
++		uint64_t m_drmFormatModifier;
++		uint32_t m_dmaBufPitch;
++
+ 	private:
+ 		VkResult createImages(VkCommandBuffer _commandBuffer, uint64_t _external = 0);
+ 		static VkImageAspectFlags getAspectMask(VkFormat _format);

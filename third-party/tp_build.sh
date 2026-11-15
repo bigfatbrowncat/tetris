@@ -28,6 +28,24 @@ while true; do
     fi
     sleep 1
 done
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+# The EXIT trap removes the lock on EVERY exit path, so a stale lock can only
+# ever come from a killed build (the steal above handles that). Do not `exec`
+# make: exec replaces this shell and clears the trap, leaving a stale lock
+# whose dead pid lets the next run steal the lock from its new holder.
+trap 'rm -rf "$LOCK_DIR" 2>/dev/null' EXIT
 
-exec make -C "$PROJ" "config=$CFG" "$@"
+# Local bgfx patch (kept in the superproject, outside the submodule): the
+# submodule is expected to sit at a pristine upstream commit, so apply our
+# patch to the working tree before building. The marker check keeps the step
+# idempotent: no-op when already applied, re-applies after a
+# `git submodule update` reset the tree. (The gmake project lives at
+# <bgfx>/.build/projects/<name>, so the bgfx root is three levels up and the
+# third-party dir one more.)
+BGFX_ROOT="$(cd "$PROJ/../../.." && pwd)"
+BGFX_PATCH="$(cd "$BGFX_ROOT/.." && pwd)/patches/bgfx/0000-dma-buf-texture-export.patch"
+if [ -f "$BGFX_PATCH" ] && ! grep -q "getTextureDmaBuf" "$BGFX_ROOT/include/bgfx/bgfx.h"; then
+    echo "[tp] applying $(basename "$BGFX_PATCH")"
+    patch -p1 -d "$BGFX_ROOT" --silent < "$BGFX_PATCH"
+fi
+
+make -C "$PROJ" "config=$CFG" "$@"
