@@ -1,8 +1,9 @@
 // Platform-neutral window + keyboard input layer for the bgfx Tetris port.
 // Exposes a small C API so the C++ game (main.cpp) stays free of
 // Objective-C++ / GTK / Win32+D3D11 details. Implemented by
-// macos/window.mm (Cocoa), gtk/window.cpp (GTK4, X11 + Wayland) and
-// windows/window.cpp (Win32 + DirectComposition + D3D11).
+// platform/cocoa/window.mm (Cocoa), platform/gtk/window.cpp
+// (GTK4, X11 + Wayland) and platform/win32/window.cpp
+// (Win32 + DirectComposition + D3D11).
 #pragma once
 #include <stdint.h>
 

@@ -10,9 +10,9 @@
 #    backend/   game logic, no UI / no OS          -> libtetrisback.a
 #    frontend/  bgfx renderer + game loop          -> libtetrisfront.a
 #    ui/        platform-neutral window/input C API (window.h)
-#    macos/     Cocoa window + input (OS-specific) -> macOS UI module
-#    gtk/       GTK4 window + input (OS-specific)  -> Linux UI module
-#    windows/   Win32+DComp+D3D11 (OS-specific)    -> Windows UI module
+#    platform/cocoa/  Cocoa window + input (OS-specific)  -> macOS UI module
+#    platform/gtk/    GTK4 window + input (OS-specific)   -> Linux UI module
+#    platform/win32/  Win32+DComp+D3D11 (OS-specific)     -> Windows UI module
 #    third-party/  bgfx / bx / bimg build targets  (see its CMakeLists.txt)
 #
 #  Build:
@@ -81,7 +81,7 @@ add_subdirectory(third-party)
 set(GEN_SHADERS "${CMAKE_BINARY_DIR}/gen-shaders")
 
 if(APPLE)
-    set(UI_SOURCES macos/window.mm)
+    set(UI_SOURCES platform/cocoa/window.mm)
     set(UI_LINK
         "-framework Cocoa"
         "-framework QuartzCore"
@@ -91,7 +91,7 @@ if(APPLE)
         "-framework CoreMedia"
         "-framework VideoToolbox")
 elseif(WIN32)
-    set(UI_SOURCES windows/window.cpp)
+    set(UI_SOURCES platform/win32/window.cpp)
     # d3d11/dxgi: the UI layer's device + composition swap chain (bgfx loads
     # them dynamically, so no import libs are needed for bgfx itself);
     # dcomp: the DirectComposition binding; d3dcompiler: the blit shader
@@ -108,7 +108,7 @@ else()
     pkg_check_modules(EPOXY REQUIRED IMPORTED_TARGET epoxy)
     pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
     pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
-    set(UI_SOURCES gtk/window.cpp)
+    set(UI_SOURCES platform/gtk/window.cpp)
     # libdrm: drm_fourcc.h (DRM_FORMAT_ABGR8888 — the fourcc of the dma-buf
     # the renderer exports each frame).
     set(UI_LINK PkgConfig::GTK4 PkgConfig::EPOXY PkgConfig::EGL PkgConfig::LIBDRM)

@@ -1,8 +1,9 @@
 // ============================================================================
 //  Tetris — entry point (platform-neutral wiring).
 //  ---------------------------------------------------------------------------
-//  Everything OS-specific lives in the UI module (macos/window.mm on macOS,
-//  gtk/window.cpp on Linux): window creation, event pumping, key mapping.
+//  Everything OS-specific lives in the UI module (platform/cocoa/window.mm
+//  on macOS, platform/gtk/window.cpp on Linux): window creation, event
+//  pumping, key mapping.
 //  Game logic is the backend (libtetrisback); the bgfx game loop is the
 //  frontend (libtetrisfront). This file only wires UI events into the
 //  frontend.

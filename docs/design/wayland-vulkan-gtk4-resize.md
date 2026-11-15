@@ -179,7 +179,7 @@ init.platformData.type = (bgfx::NativeWindowHandleType::Enum)win->nwhType;
 init.resolution.reset = m_resetFlags;
 ```
 
-### 4.2 The content subsurface (created in `gtk/window.cpp`)
+### 4.2 The content subsurface (created in `platform/gtk/window.cpp`)
 
 On Wayland, `uiCreateWindow()` grabs the GTK root's `wl_surface` and
 `wl_display`, creates a child surface, and parents it as a subsurface:
@@ -229,7 +229,7 @@ The GTK layer wires it up (Wayland branch of `uiCreateWindow()`):
 g_signal_connect(surf, "layout", G_CALLBACK(onContentLayout), nullptr);
 ```
 
-and the handler (`gtk/window.cpp`):
+and the handler (`platform/gtk/window.cpp`):
 
 ```cpp
 static void onContentLayout(GdkSurface* surface, int width, int height, gpointer user) {
@@ -278,16 +278,16 @@ the window tracks the pointer with zero added latency.
 The at-most-one-frame gap is invisible by construction:
 
 - **Grow:** the newly exposed area has no subsurface under it, so the
-  compositor shows the root's pixels there — the window background. `gtk/window.cpp`
+  compositor shows the root's pixels there — the window background. `platform/gtk/window.cpp`
   sets it to `#101018`, the renderer's clear color (`0x101018ff` in
   `frontend/renderer.cpp`), via a `GTK_STYLE_PROVIDER_PRIORITY_APPLICATION` CSS
   provider. The scene's letterbox margin is the same clear color, so the gap is
-  seamless (same trick as `macos/window.mm`, which sets the NSWindow background).
+  seamless (same trick as `platform/cocoa/window.mm`, which sets the NSWindow background).
 - **Shrink:** the subsurface is *larger* than the content area, but the
   compositor clips a subsurface to its parent's bounds — nothing is exposed.
 
 ```cpp
-// gtk/window.cpp, Wayland branch of uiCreateWindow()
+// platform/gtk/window.cpp, Wayland branch of uiCreateWindow()
 GtkCssProvider* cssProvider = gtk_css_provider_new();
 gtk_css_provider_load_from_string(cssProvider, "window { background: #101018; }");
 gtk_style_context_add_provider_for_display(
@@ -586,9 +586,9 @@ unchanged; it covers any frame where the layout/resize hook didn't fire.
 | `syncPresent()` / `render()` / `endFrame()` API | `frontend/renderer.h` |
 | `setWindowSize` (async) / `repaintSynchronous` (sync), game loop, 3-frame call site | `frontend/tetris_frontend.cpp` |
 | `m_syncResize`, `m_pxW/H`, `m_resizePending`, `m_lastRenderedW/H`, cv/mutex | `frontend/tetris_frontend.h` |
-| Subsurface creation, `"layout"` handler, matching window background (CSS), `uiSetFrameSyncCallback`, `updateContentSubPosition` | `gtk/window.cpp` |
+| Subsurface creation, `"layout"` handler, matching window background (CSS), `uiSetFrameSyncCallback`, `updateContentSubPosition` | `platform/gtk/window.cpp` |
 | `UiFrameSyncCallback` typedef, `UI_NWH_WAYLAND`, `uiSetFrameSyncCallback` | `ui/window.h` |
 | `s_asyncResize` + `onFrameSync` (async vs blocking), callback registration, main-loop ordering | `main.cpp` |
-| Blocking `windowDidResize:` repaint + matching NSWindow background (macOS) | `macos/window.mm` |
+| Blocking `windowDidResize:` repaint + matching NSWindow background (macOS) | `platform/cocoa/window.mm` |
 | SPIR-V shader build | `scripts/build_shaders.py` |
 | Shader staging into build dir | `CMakeLists.txt` |
