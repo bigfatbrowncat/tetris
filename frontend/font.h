@@ -3,7 +3,7 @@
 #pragma once
 #include <cstdint>
 
-namespace tetris {
+namespace tetris::frontend {
 
 // 95 glyphs (chars 32..126), 7 bytes each, top row first.
 static const unsigned char FONT5x7[95][7] = {
@@ -153,4 +153,4 @@ inline UVRect solidUV() {
     return { 0.0f, STRIP_Y / (float)ATLAS_H, 8.0f / (float)ATLAS_W, (STRIP_Y + 8) / (float)ATLAS_H };
 }
 
-} // namespace tetris
+}  // namespace tetris::frontend

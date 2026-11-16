@@ -14,6 +14,11 @@
 //  bgfx::init, on the UI thread), frame() runs one update+render iteration
 //  inside the callback, and shutdownNow() tears everything down. The two
 //  communicate through atomics and a small mutex-guarded key queue.
+//
+//  This class is platform-agnostic: all the platform-specific rendering
+//  lives in the platform modules (platform/<os>/renderer.{h,cpp}, which
+//  provide the concrete tetris::platform::<os>::Renderer behind the
+//  common tetris::frontend::Renderer, see frontend/renderer.h).
 // ============================================================================
 #pragma once
 
@@ -27,7 +32,7 @@
 #include "tetris_backend.h"
 #include "ui/window.h"
 
-namespace tetris {
+namespace tetris::frontend {
 
 class Renderer;
 
@@ -116,4 +121,4 @@ private:
     int m_frameNo = 0;
 };
 
-}  // namespace tetris
+}  // namespace tetris::frontend

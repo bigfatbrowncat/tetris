@@ -8,12 +8,19 @@
 #  ---------------------------------------------------------------------------
 #  Modules:
 #    backend/   game logic, no UI / no OS          -> libtetrisback.a
-#    frontend/  bgfx renderer + game loop          -> libtetrisfront.a
+#    frontend/  common (platform-agnostic) bgfx renderer + game loop
+#               -> libtetrisfront.a
 #    ui/        platform-neutral window/input C API (window.h)
-#    platform/cocoa/  Cocoa window + input (OS-specific)  -> macOS UI module
-#    platform/gtk/    GTK4 window + input (OS-specific)   -> Linux UI module
-#    platform/win32/  Win32+DComp+D3D11 (OS-specific)     -> Windows UI module
+#    platform/cocoa/  Cocoa window + input + renderer hooks (OS-specific)
+#    platform/gtk/    GTK4 window + input + renderer hooks (OS-specific)
+#    platform/win32/  Win32+DComp+D3D11 window + input + renderer hooks
+#                     (OS-specific)
 #    third-party/  bgfx / bx / bimg build targets  (see its CMakeLists.txt)
+#
+#  The renderer is split the same way: the common part (scene construction,
+#  draw flow — tetris::frontend::Renderer) lives in frontend/, and each
+#  platform module adds a renderer.cpp (tetris::platform::<os>::Renderer)
+#  that implements the platform hooks and the createRenderer() factory.
 #
 #  Build:
 #    cmake -S . -B build
@@ -82,6 +89,7 @@ set(GEN_SHADERS "${CMAKE_BINARY_DIR}/gen-shaders")
 
 if(APPLE)
     set(UI_SOURCES platform/cocoa/window.mm)
+    set(FRONTEND_PLATFORM_SOURCES platform/cocoa/renderer.cpp)
     set(UI_LINK
         "-framework Cocoa"
         "-framework QuartzCore"
@@ -92,6 +100,7 @@ if(APPLE)
         "-framework VideoToolbox")
 elseif(WIN32)
     set(UI_SOURCES platform/win32/window.cpp)
+    set(FRONTEND_PLATFORM_SOURCES platform/win32/renderer.cpp)
     # d3d11/dxgi: the UI layer's device + composition swap chain (bgfx loads
     # them dynamically, so no import libs are needed for bgfx itself);
     # dcomp: the DirectComposition binding; d3dcompiler: the blit shader
@@ -109,6 +118,7 @@ else()
     pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
     pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
     set(UI_SOURCES platform/gtk/window.cpp)
+    set(FRONTEND_PLATFORM_SOURCES platform/gtk/renderer.cpp)
     # libdrm: drm_fourcc.h (DRM_FORMAT_ABGR8888 — the fourcc of the dma-buf
     # the renderer exports each frame).
     set(UI_LINK PkgConfig::GTK4 PkgConfig::EPOXY PkgConfig::EGL PkgConfig::LIBDRM)
@@ -124,11 +134,13 @@ target_include_directories(tetrisback PUBLIC
     ${CMAKE_SOURCE_DIR}/backend)
 
 # ----------------------------------------------------------------------------
-#  tetrisfront — bgfx renderer + game loop (links the backend)
+#  tetrisfront — common bgfx renderer + game loop (links the backend), plus
+#  the platform module's renderer.cpp (the platform hooks + createRenderer).
 # ----------------------------------------------------------------------------
 add_library(tetrisfront STATIC
     frontend/renderer.cpp
-    frontend/tetris_frontend.cpp)
+    frontend/tetris_frontend.cpp
+    ${FRONTEND_PLATFORM_SOURCES})
 target_include_directories(tetrisfront PUBLIC
     ${PLATFORM_SHADERS_INC}      # generated shader headers (build dir)
     ${CMAKE_SOURCE_DIR}          # ui/window.h etc.

@@ -1,18 +1,18 @@
 // TetrisFrontend implementation: game loop over TetrisBackend + Renderer.
+// Platform-agnostic: the concrete Renderer is provided by the platform
+// module (createRenderer, see frontend/renderer.h).
 #include "tetris_frontend.h"
 
 #include "renderer.h"
-
-#include <bgfx/bgfx.h>
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
 
-namespace tetris {
+namespace tetris::frontend {
 
-TetrisFrontend::TetrisFrontend() : m_renderer(new Renderer()) {}
+TetrisFrontend::TetrisFrontend() : m_renderer(createRenderer()) {}
 TetrisFrontend::~TetrisFrontend() {}
 
 void TetrisFrontend::pushKey(TetrisBackend::Key k) {
@@ -194,4 +194,4 @@ void TetrisFrontend::shutdownNow() {
     m_done.store(true);
 }
 
-}  // namespace tetris
+}  // namespace tetris::frontend

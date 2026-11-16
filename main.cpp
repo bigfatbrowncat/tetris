@@ -1,12 +1,14 @@
 // ============================================================================
 //  Tetris — entry point (platform-neutral wiring).
 //  ---------------------------------------------------------------------------
-//  Everything OS-specific lives in the UI module (platform/cocoa/window.mm
-//  on macOS, platform/gtk/window.cpp on Linux): window creation, event
-//  pumping, key mapping.
-//  Game logic is the backend (libtetrisback); the bgfx game loop is the
-//  frontend (libtetrisfront). This file only wires UI events into the
-//  frontend.
+//  Everything OS-specific lives in the platform modules (platform/cocoa/
+//  on macOS, platform/gtk/ on Linux, platform/win32/ on Windows): window
+//  creation, event pumping, key mapping, and the platform part of the
+//  renderer (the concrete tetris::platform::<os>::Renderer behind the
+//  common tetris::frontend::Renderer).
+//  Game logic is the backend (libtetrisback); the bgfx game loop and the
+//  common renderer are the frontend (libtetrisfront). This file only wires
+//  UI events into the frontend.
 //
 //  Two frontend modes:
 //    - Threaded (macOS): a dedicated game thread owns bgfx (init/frame/
@@ -36,7 +38,8 @@
 #include <cstdio>
 #include <thread>
 
-using namespace tetris;
+using namespace tetris;           // TetrisBackend
+using namespace tetris::frontend; // TetrisFrontend
 
 // Map the UI layer's logical keys to backend input events.
 static TetrisBackend::Key toBackendKey(int k) {
