@@ -66,39 +66,122 @@ public:
         reset();
     }
 
-    void handleKey(TetrisBackend::Key k) {
+    // --- the game's own key repeater (the system's auto-repeat is not
+    //     used) -----------------------------------------------------------
+    // The repeatable keys: Left, Right, Down, RotateCW.
+    enum { REP_LEFT = 0, REP_RIGHT, REP_DOWN, REP_CW, REP_NUM };
+    struct Repeat {
+        int refs = 0;        // physical keys mapping to this logical key
+                             // (arrow + the WASD alias may be held at once)
+        double accMs = 0.0;  // DT accumulator (ms); -DT right after a press
+                             // (the one-DT pause before the first repeat)
+    };
+    Repeat m_rep[REP_NUM];
+    // Held repeatable keys, oldest -> newest; the back (the most recently
+    // pressed) is the active one. A key appears at most once.
+    std::deque<TetrisBackend::Key> m_held;
+
+    static int repIndex(TetrisBackend::Key k) {
         switch (k) {
-            case TetrisBackend::Key::Quit:
-                quit = true;
+            case TetrisBackend::Key::Left:     return REP_LEFT;
+            case TetrisBackend::Key::Right:    return REP_RIGHT;
+            case TetrisBackend::Key::Down:     return REP_DOWN;
+            case TetrisBackend::Key::RotateCW: return REP_CW;
+            default:                           return -1;
+        }
+    }
+
+    // One fifth of the falling tick: the repeat interval (DT).
+    double dtIntervalMs() const { return gravityInterval() / 5.0; }
+
+    // One input action (a press or a repeat step).
+    void performAction(TetrisBackend::Key k) {
+        switch (k) {
+            case TetrisBackend::Key::Left:  move(-1, 0); break;
+            case TetrisBackend::Key::Right: move(1, 0);  break;
+            case TetrisBackend::Key::Down:
+                if (move(0, 1)) { score += 1; bumpHigh(); wantGravityReset = true; }
                 break;
-            case TetrisBackend::Key::Restart:
-                reset();
-                break;
+            case TetrisBackend::Key::RotateCW:  rotate(1);  break;
+            case TetrisBackend::Key::RotateCCW: rotate(-1); break;
+            case TetrisBackend::Key::HardDrop:  hardDrop(); wantGravityReset = true; break;
+            default: break;
+        }
+        if (wantGravityReset) {
+            gravityAccMs = 0.0;
+            wantGravityReset = false;
+        }
+    }
+
+    void keyDown(TetrisBackend::Key k) {
+        switch (k) {
+            case TetrisBackend::Key::Quit:    quit = true; return;
+            case TetrisBackend::Key::Restart: reset(); return;
             case TetrisBackend::Key::Pause:
                 if (!gameOver) {
                     paused = !paused;
                     gravityAccMs = 0.0;
                 }
-                break;
-            default:
-                if (gameOver || paused) return;
-                handleGameKey(k);
-                if (wantGravityReset) {
-                    gravityAccMs = 0.0;
-                    wantGravityReset = false;
-                }
-                break;
+                return;
+            default: break;
         }
+        if (gameOver) return;
+        const int i = repIndex(k);
+        if (i < 0) {  // RotateCCW / HardDrop: act once on the press
+            if (paused) return;
+            performAction(k);
+            return;
+        }
+        Repeat& r = m_rep[i];
+        if (r.refs > 0) {  // an alias of a key that is already held
+                            // (arrow + WASD): count it, act on the release
+                            // of the last one
+            r.refs++;
+            return;
+        }
+        r.refs = 1;
+        m_held.push_back(k);
+        if (!paused) {
+            performAction(k);          // the press moves once, immediately
+            r.accMs = -dtIntervalMs(); // one DT of pause before the first repeat
+        }
+    }
+
+    void keyUp(TetrisBackend::Key k) {
+        const int i = repIndex(k);
+        if (i < 0) return;
+        Repeat& r = m_rep[i];
+        if (r.refs <= 0) return;
+        if (--r.refs > 0) return;  // another alias of the key is still held
+        m_held.erase(std::remove(m_held.begin(), m_held.end(), k), m_held.end());
     }
 
     void update(double dtSeconds) {
         if (gameOver || paused) return;
+        // A sub-millisecond epsilon so floating-point accumulation of dt
+        // cannot push a step a frame late (the timers below compare
+        // accumulated doubles against exact ms values).
+        constexpr double EPS_MS = 1e-3;
         gravityAccMs += dtSeconds * 1000.0;
         while (!gameOver && !paused) {
-            int interval = gravityInterval();
-            if (gravityAccMs < interval) break;
+            const double interval = gravityInterval();
+            if (gravityAccMs < interval - EPS_MS) break;
             gravityAccMs -= interval;
             gravityStep();
+        }
+        // The held key pressed most recently moves the piece: one step per
+        // DT (gravityInterval/5) while it is held. Only the active (last
+        // pressed) key's timer runs; the others are frozen until they are
+        // the most recent again.
+        if (!m_held.empty()) {
+            const TetrisBackend::Key active = m_held.back();
+            Repeat& r = m_rep[repIndex(active)];
+            r.accMs += dtSeconds * 1000.0;
+            const double dt = dtIntervalMs();
+            while (r.accMs >= dt - EPS_MS) {
+                r.accMs -= dt;
+                performAction(active);
+            }
         }
     }
 
@@ -157,6 +240,8 @@ private:
         score = 0; level = 0; lines = 0;
         gameOver = false; paused = false; wantGravityReset = false;
         gravityAccMs = 0.0;
+        for (auto& r : m_rep) { r.refs = 0; r.accMs = 0.0; }
+        m_held.clear();
         spawn();
     }
 
@@ -268,27 +353,14 @@ private:
         if (!move(0, 1)) lockPiece();
     }
 
-    void handleGameKey(TetrisBackend::Key k) {
-        switch (k) {
-            case TetrisBackend::Key::Left:  move(-1, 0); break;
-            case TetrisBackend::Key::Right: move(1, 0);  break;
-            case TetrisBackend::Key::Down:
-                if (move(0, 1)) { score += 1; bumpHigh(); wantGravityReset = true; }
-                break;
-            case TetrisBackend::Key::RotateCW:  rotate(1);  break;
-            case TetrisBackend::Key::RotateCCW: rotate(-1); break;
-            case TetrisBackend::Key::HardDrop:  hardDrop(); wantGravityReset = true; break;
-            default: break;
-        }
-    }
-
     int nextType() const { return queue.empty() ? 0 : queue.front(); }
 };
 
 TetrisBackend::TetrisBackend() : m_impl(new Impl()) {}
 TetrisBackend::~TetrisBackend() { delete m_impl; }
 
-void TetrisBackend::handleKey(Key k) { m_impl->handleKey(k); }
+void TetrisBackend::keyDown(Key k) { m_impl->keyDown(k); }
+void TetrisBackend::keyUp(Key k) { m_impl->keyUp(k); }
 void TetrisBackend::update(double dtSeconds) { m_impl->update(dtSeconds); }
 TetrisBackend::Snapshot TetrisBackend::state() const { return m_impl->state(); }
 bool TetrisBackend::quitRequested() const { return m_impl->quitRequested(); }

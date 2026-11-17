@@ -1,5 +1,4 @@
-/build-debug
-/build-release
+/cmake-build-*
 /tetris_high.txt
 /tetris_shot.bmp
 .DS_Store

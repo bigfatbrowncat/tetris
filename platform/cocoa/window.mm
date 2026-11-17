@@ -4,6 +4,7 @@
 #include <deque>
 #include <atomic>
 #include <cstdint>
+#include <set>
 #include "ui/window.h"
 
 static NSApplication* s_app = nil;
@@ -12,7 +13,12 @@ static id s_delegate = nil;
 static UiWindow s_uiWindow = {UI_NWH_DEFAULT, nullptr};
 static std::atomic<bool> s_quit{false};
 static std::mutex s_keyMutex;
-static std::deque<int> s_keys;
+// Key state changes: (logical key, 1 = pressed / 0 = released).
+static std::deque<std::pair<int, int>> s_keys;
+// Key codes currently held down: the system's key auto-repeat re-fires
+// keyDown: while a key is down, but only the first press produces a
+// "down" event (the game implements its own key repeater).
+static std::set<unsigned short> s_heldKeys;
 static std::atomic<uint32_t> s_pxW{0};
 static std::atomic<uint32_t> s_pxH{0};
 static UiFrameSyncCallback s_frameSyncCb = nullptr;
@@ -47,11 +53,35 @@ static void updatePixelSize() {
 @implementation TetrisView
 - (BOOL)acceptsFirstResponder { return YES; }
 - (void)keyDown:(NSEvent*)event {
-    int k = mapKey((unsigned short)[event keyCode]);
-    if (k != KEY_NONE) {
-        std::lock_guard<std::mutex> lk(s_keyMutex);
-        s_keys.push_back(k);
+    const unsigned short code = (unsigned short)[event keyCode];
+    const int k = mapKey(code);
+    if (k == KEY_NONE) return;
+    std::lock_guard<std::mutex> lk(s_keyMutex);
+    // insert() reports whether the code was new: the system's auto-repeat
+    // re-fires keyDown: for a key that is already down — only the first
+    // press becomes a "down" event.
+    if (s_heldKeys.insert(code).second)
+        s_keys.push_back({k, 1});
+}
+- (void)keyUp:(NSEvent*)event {
+    const unsigned short code = (unsigned short)[event keyCode];
+    const int k = mapKey(code);
+    if (k == KEY_NONE) return;
+    std::lock_guard<std::mutex> lk(s_keyMutex);
+    if (s_heldKeys.erase(code) != 0)
+        s_keys.push_back({k, 0});
+}
+- (void)resignKey {
+    // The view stopped being the key view (window lost focus / the app
+    // deactivated): the key-ups of still-held keys are not guaranteed to
+    // arrive — flush them so the game's "held" state cannot go stale.
+    [super resignKey];
+    std::lock_guard<std::mutex> lk(s_keyMutex);
+    for (unsigned short code : s_heldKeys) {
+        const int k = mapKey(code);
+        if (k != KEY_NONE) s_keys.push_back({k, 0});
     }
+    s_heldKeys.clear();
 }
 @end
 
@@ -140,12 +170,16 @@ int uiShouldQuit(void) {
     return s_quit ? 1 : 0;
 }
 
-int uiPopKey(void) {
+int uiPopKey(int* down) {
     std::lock_guard<std::mutex> lk(s_keyMutex);
-    if (s_keys.empty()) return KEY_NONE;
-    int k = s_keys.front();
+    if (s_keys.empty()) {
+        if (down) *down = 0;
+        return KEY_NONE;
+    }
+    std::pair<int, int> e = s_keys.front();
     s_keys.pop_front();
-    return k;
+    if (down) *down = e.second;
+    return e.first;
 }
 
 void uiWindowSize(uint32_t* w, uint32_t* h) {

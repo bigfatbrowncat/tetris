@@ -75,6 +75,7 @@
 #include <unistd.h>
 #include <deque>
 #include <mutex>
+#include <set>
 #include "ui/window.h"
 
 // ---------------------------------------------------------------------------
@@ -84,9 +85,15 @@ static GtkWidget* s_win = nullptr;
 static GtkWidget* s_area = nullptr;
 static GtkWidget* s_header = nullptr;
 static GtkEventController* s_keyCtrl = nullptr;
+static GtkEventController* s_focusCtrl = nullptr;
 static UiWindow s_uiWindow = {UI_NWH_DEFAULT, nullptr};
 static std::mutex s_keyMutex;
-static std::deque<int> s_keys;
+// Key state changes: (logical key, 1 = pressed / 0 = released).
+static std::deque<std::pair<int, int>> s_keys;
+// Keyvals currently held down: the system's key auto-repeat re-fires
+// "key-pressed" while a key is down, but only the first press produces a
+// "down" event (the game implements its own key repeater).
+static std::set<guint> s_heldKeys;
 static volatile bool s_quit = false;
 
 static UiFrameSyncCallback s_frameSyncCb = nullptr;
@@ -144,13 +151,42 @@ static int mapKey(guint keyval) {
 static gboolean onKeyPressed(GtkEventControllerKey* ctrl, guint keyval,
                               guint code, GdkModifierType state, gpointer user) {
     (void)ctrl; (void)code; (void)state; (void)user;
-    int k = mapKey(keyval);
+    const int k = mapKey(keyval);
     if (k != KEY_NONE) {
         std::lock_guard<std::mutex> lk(s_keyMutex);
-        s_keys.push_back(k);
+        // insert() reports whether the keyval was new: the system's
+        // auto-repeat re-fires this for a key that is already down — only
+        // the first press becomes a "down" event.
+        if (s_heldKeys.insert(keyval).second)
+            s_keys.push_back({k, 1});
         return TRUE;  // consume so GTK doesn't beep on unmapped keys
     }
     return FALSE;
+}
+
+static gboolean onKeyReleased(GtkEventControllerKey* ctrl, guint keyval,
+                               guint code, GdkModifierType state, gpointer user) {
+    (void)ctrl; (void)code; (void)state; (void)user;
+    const int k = mapKey(keyval);
+    if (k != KEY_NONE) {
+        std::lock_guard<std::mutex> lk(s_keyMutex);
+        if (s_heldKeys.erase(keyval) != 0)
+            s_keys.push_back({k, 0});
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// The window lost focus: the key-ups of still-held keys are not guaranteed
+// to arrive — flush them so the game's "held" state cannot go stale.
+static void onFocusOut(GtkEventControllerFocus* ctrl, gpointer user) {
+    (void)ctrl; (void)user;
+    std::lock_guard<std::mutex> lk(s_keyMutex);
+    for (guint kv : s_heldKeys) {
+        const int k = mapKey(kv);
+        if (k != KEY_NONE) s_keys.push_back({k, 0});
+    }
+    s_heldKeys.clear();
 }
 
 static gboolean onCloseRequest(GtkWindow* win, gpointer user) {
@@ -522,11 +558,17 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
         display, GTK_STYLE_PROVIDER(cssProvider), GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(cssProvider);
 
-    // GTK4 widgets do NOT own event controllers: keep our reference alive for
-    // the window's lifetime and remove it in uiShutdown() before destroy.
+    // GTK4 widgets do NOT own event controllers: keep our references alive
+    // for the window's lifetime and remove them in uiShutdown() before
+    // destroy.
     s_keyCtrl = gtk_event_controller_key_new();
     g_signal_connect(s_keyCtrl, "key-pressed", G_CALLBACK(onKeyPressed), nullptr);
+    g_signal_connect(s_keyCtrl, "key-released", G_CALLBACK(onKeyReleased), nullptr);
     gtk_widget_add_controller(s_win, s_keyCtrl);
+
+    s_focusCtrl = gtk_event_controller_focus_new();
+    g_signal_connect(s_focusCtrl, "focus-out", G_CALLBACK(onFocusOut), nullptr);
+    gtk_widget_add_controller(s_win, s_focusCtrl);
 
     g_signal_connect(s_win, "close-request", G_CALLBACK(onCloseRequest), nullptr);
 
@@ -623,12 +665,16 @@ int uiShouldQuit(void) {
     return s_quit ? 1 : 0;
 }
 
-int uiPopKey(void) {
+int uiPopKey(int* down) {
     std::lock_guard<std::mutex> lk(s_keyMutex);
-    if (s_keys.empty()) return KEY_NONE;
-    int k = s_keys.front();
+    if (s_keys.empty()) {
+        if (down) *down = 0;
+        return KEY_NONE;
+    }
+    std::pair<int, int> e = s_keys.front();
     s_keys.pop_front();
-    return k;
+    if (down) *down = e.second;
+    return e.first;
 }
 
 void uiWindowSize(uint32_t* w, uint32_t* h) {
@@ -669,6 +715,10 @@ void uiShutdown(void) {
         if (s_keyCtrl != nullptr) {
             gtk_widget_remove_controller(s_win, s_keyCtrl);
             s_keyCtrl = nullptr;
+        }
+        if (s_focusCtrl != nullptr) {
+            gtk_widget_remove_controller(s_win, s_focusCtrl);
+            s_focusCtrl = nullptr;
         }
         gtk_window_destroy(GTK_WINDOW(s_win));
         s_win = nullptr;

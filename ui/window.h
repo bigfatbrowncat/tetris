@@ -70,8 +70,12 @@ void uiPumpEvents(double timeoutSec);
 // True once the user asked to quit (Q/Esc or the window close button).
 int uiShouldQuit(void);
 
-// Pop one mapped key; returns KEY_NONE if none pending.
-int uiPopKey(void);
+// Pop one key state change; returns KEY_NONE if none pending.
+// *down (optional): set to 1 when the key was pressed, 0 when released.
+// The platform deduplicates the system's key auto-repeat: each physical
+// key press produces at most one "down" and each release one "up" (the
+// game implements its own key repeater).
+int uiPopKey(int* down);
 
 // Current drawable (pixel) size of the window content.
 void uiWindowSize(uint32_t* w, uint32_t* h);

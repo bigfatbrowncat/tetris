@@ -59,7 +59,11 @@ public:
     void shutdownNow();
 
     // --- thread-safe UI-side API --------------------------------------------
-    void pushKey(TetrisBackend::Key k);
+    // A key state change from the UI layer (down = the key was pressed,
+    // up = released). The platform deduplicates the system's key
+    // auto-repeat: one down per physical press, one up per release — the
+    // game's own repeater (TetrisBackend) decides when a held key repeats.
+    void pushKey(TetrisBackend::Key k, bool down);
     // Update the target pixel size (non-blocking, threaded mode). If it
     // changed, the game thread is woken so it resets bgfx + renders the new
     // size on its next iteration.
@@ -86,7 +90,8 @@ private:
     bool m_initDone = false;
 
     std::mutex m_keysMutex;
-    std::deque<TetrisBackend::Key> m_keys;
+    struct KeyEvent { TetrisBackend::Key key; bool down; };
+    std::deque<KeyEvent> m_keys;
     std::atomic<uint32_t> m_pxW{640}, m_pxH{640};
     std::atomic<bool> m_stop{false};
     std::atomic<bool> m_done{false};

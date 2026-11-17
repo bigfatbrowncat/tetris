@@ -30,6 +30,12 @@
 //    P                : pause
 //    R                : restart
 //    Q / Esc          : quit
+//
+//  Holding left / right / down / up: the game moves the piece with its own
+//  repeater — one step immediately on the press, a pause of one DT, then
+//  one step per DT while the key is held (DT = 1/5 of the falling tick, so
+//  the repeat speeds up with the level). The system's key auto-repeat is
+//  ignored (its delay and rate vary from system to system).
 // ============================================================================
 
 #include "tetris_frontend.h"
@@ -103,9 +109,9 @@ int main() {
         uiSetFrameDriver(&onFrameDriver, &frontend);
         while (!frontend.loopDone()) {
             uiPumpEvents(0.016);
-            int k;
-            while ((k = uiPopKey()) != KEY_NONE)
-                frontend.pushKey(toBackendKey(k));
+            int k, down = 0;
+            while ((k = uiPopKey(&down)) != KEY_NONE)
+                frontend.pushKey(toBackendKey(k), down != 0);
             if (uiShouldQuit()) frontend.requestStop();
         }
         frontend.shutdownNow();
@@ -116,9 +122,9 @@ int main() {
         std::thread gameThread(&TetrisFrontend::run, &frontend, window);
         while (!frontend.loopDone()) {
             uiPumpEvents(0.016);
-            int k;
-            while ((k = uiPopKey()) != KEY_NONE)
-                frontend.pushKey(toBackendKey(k));
+            int k, down = 0;
+            while ((k = uiPopKey(&down)) != KEY_NONE)
+                frontend.pushKey(toBackendKey(k), down != 0);
             uint32_t pw, ph;
             uiWindowSize(&pw, &ph);
             frontend.repaintSynchronous(pw, ph);

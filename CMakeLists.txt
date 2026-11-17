@@ -15,6 +15,7 @@
 #    platform/gtk/    GTK4 window + input + renderer hooks (OS-specific)
 #    platform/win32/  Win32+DComp+D3D11 window + input + renderer hooks
 #                     (OS-specific)
+#    tests/     standalone backend tests (no UI/OS deps) -> test_das
 #    third-party/  bgfx / bx / bimg build targets  (see its CMakeLists.txt)
 #
 #  The renderer is split the same way: the common part (scene construction,
@@ -58,6 +59,10 @@ if(APPLE)
 else()
     project(tetris C CXX)
 endif()
+
+# CTest: the tests below run with `ctest --test-dir <build-dir>`
+# (BUILD_TESTING, on by default, disables them).
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 20)  # bx headers require C++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -207,6 +212,16 @@ add_executable(tetris
 target_link_libraries(tetris PRIVATE
     tetrisfront
     ${UI_LINK})
+
+# ----------------------------------------------------------------------------
+#  test_das — standalone verification of the backend's key repeater (DAS).
+#  The backend is pure C++ (no UI/OS), so the test links tetrisback directly:
+#    cmake --build build --target test_das   # then run ./build/test_das
+#  The test exits non-zero if any check fails.
+# ----------------------------------------------------------------------------
+add_executable(test_das tests/test_das.cpp)
+target_link_libraries(test_das PRIVATE tetrisback)
+add_test(NAME das COMMAND test_das)
 
 # ----------------------------------------------------------------------------
 #  vulkan_resize_test — standalone bgfx + GTK4 + Vulkan + Wayland resize demo.

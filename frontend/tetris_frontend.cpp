@@ -15,9 +15,9 @@ namespace tetris::frontend {
 TetrisFrontend::TetrisFrontend() : m_renderer(createRenderer()) {}
 TetrisFrontend::~TetrisFrontend() {}
 
-void TetrisFrontend::pushKey(TetrisBackend::Key k) {
+void TetrisFrontend::pushKey(TetrisBackend::Key k, bool down) {
     std::lock_guard<std::mutex> lock(m_keysMutex);
-    m_keys.push_back(k);
+    m_keys.push_back({k, down});
 }
 
 void TetrisFrontend::setWindowSize(uint32_t w, uint32_t h) {
@@ -85,12 +85,14 @@ bool TetrisFrontend::start(const UiWindow* win) {
 }
 
 void TetrisFrontend::doFrame(uint32_t pixelW, uint32_t pixelH, double dt) {
-    // Input: drain the key queue pushed by the UI thread.
+    // Input: drain the key state changes pushed by the UI thread.
     {
         std::lock_guard<std::mutex> lock(m_keysMutex);
         while (!m_keys.empty()) {
-            m_backend.handleKey(m_keys.front());
+            const KeyEvent e = m_keys.front();
             m_keys.pop_front();
+            if (e.down) m_backend.keyDown(e.key);
+            else        m_backend.keyUp(e.key);
         }
     }
 

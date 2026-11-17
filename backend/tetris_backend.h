@@ -1,9 +1,12 @@
 // ============================================================================
 //  TetrisBackend — game logic API (the frontend/backend interface).
 //  ---------------------------------------------------------------------------
-//  Pure game state and rules: board, pieces, scoring, gravity, high score.
+//  Pure game state and rules: board, pieces, scoring, gravity, high score,
+//  and the game's own key repeater (the system's key auto-repeat is not
+//  used: the UI layer reports key down/up, and the game decides when a
+//  held key repeats).
 //  No bgfx, no windowing, no OS-specific code. The frontend drives it:
-//  pushKey() + update(dt) each frame, and reads state() to render.
+//  keyDown/keyUp + update(dt) each frame, and reads state() to render.
 // ============================================================================
 #pragma once
 
@@ -51,8 +54,20 @@ public:
     TetrisBackend(const TetrisBackend&) = delete;
     TetrisBackend& operator=(const TetrisBackend&) = delete;
 
-    // Handle a logical input event.
-    void handleKey(Key k);
+    // Key state changes from the UI layer.
+    //
+    // Repeatable keys (Left, Right, Down, RotateCW): a press moves the
+    // piece once immediately; then, unless the key is released, it repeats
+    // every DT = gravityInterval()/5 (one fifth of the falling tick — it
+    // speeds up with the level) after a pause of one DT. When several
+    // repeatable keys are held at once, the most recently pressed one
+    // moves the piece; releasing it hands the movement back to the
+    // previously pressed one.
+    //
+    // The other keys (RotateCCW, HardDrop, Pause, Restart, Quit) act once,
+    // on the press.
+    void keyDown(Key k);
+    void keyUp(Key k);
 
     // Advance the game by dt seconds (drives piece gravity).
     void update(double dtSeconds);

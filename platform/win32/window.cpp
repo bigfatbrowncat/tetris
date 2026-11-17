@@ -99,6 +99,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -204,9 +205,13 @@ struct Win {
     bool frameDrivenThisPump = false;  // a resize frame was driven during the drain
     bool quit = false;
 
-    // Input.
+    // Input. Key state changes: (logical key, 1 = pressed / 0 = released).
     std::mutex keyMutex;
-    std::deque<int> keys;
+    std::deque<std::pair<int, int>> keys;
+    // VKs currently held down: WM_KEYDOWN also fires on the system's key
+    // auto-repeat, but only the first press produces a "down" event (the
+    // game implements its own key repeater).
+    std::set<UINT> heldKeys;
 
     // Frame driver (the game), called once per displayed frame from this
     // thread (uiPumpEvents / WM_NCCALCSIZE).
@@ -732,9 +737,36 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int k = mapKey(wParam);
             if (k != KEY_NONE) {
                 std::lock_guard<std::mutex> lk(g.keyMutex);
-                g.keys.push_back(k);
+                // insert() reports whether the VK was new: WM_KEYDOWN also
+                // fires on the system's auto-repeat for a key that is
+                // already down — only the first press becomes a "down"
+                // event.
+                if (g.heldKeys.insert((UINT)wParam).second)
+                    g.keys.push_back({k, 1});
                 return 0;
             }
+            break;
+        }
+        case WM_KEYUP: {
+            int k = mapKey(wParam);
+            if (k != KEY_NONE) {
+                std::lock_guard<std::mutex> lk(g.keyMutex);
+                if (g.heldKeys.erase((UINT)wParam) != 0)
+                    g.keys.push_back({k, 0});
+                return 0;
+            }
+            break;
+        }
+        case WM_KILLFOCUS: {
+            // The window lost focus: the key-ups of still-held keys are not
+            // delivered — flush them so the game's "held" state cannot go
+            // stale.
+            std::lock_guard<std::mutex> lk(g.keyMutex);
+            for (UINT vk : g.heldKeys) {
+                const int k = mapKey(vk);
+                if (k != KEY_NONE) g.keys.push_back({k, 0});
+            }
+            g.heldKeys.clear();
             break;
         }
         case WM_TIMER:
@@ -952,12 +984,16 @@ int uiShouldQuit(void) {
     return g.quit ? 1 : 0;
 }
 
-int uiPopKey(void) {
+int uiPopKey(int* down) {
     std::lock_guard<std::mutex> lk(g.keyMutex);
-    if (g.keys.empty()) return KEY_NONE;
-    int k = g.keys.front();
+    if (g.keys.empty()) {
+        if (down) *down = 0;
+        return KEY_NONE;
+    }
+    std::pair<int, int> e = g.keys.front();
     g.keys.pop_front();
-    return k;
+    if (down) *down = e.second;
+    return e.first;
 }
 
 void uiWindowSize(uint32_t* w, uint32_t* h) {
