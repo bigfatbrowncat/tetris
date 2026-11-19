@@ -34,18 +34,31 @@ done
 # whose dead pid lets the next run steal the lock from its new holder.
 trap 'rm -rf "$LOCK_DIR" 2>/dev/null' EXIT
 
-# Local bgfx patch (kept in the superproject, outside the submodule): the
+# Local bgfx patches (kept in the superproject, outside the submodule): the
 # submodule is expected to sit at a pristine upstream commit, so apply our
-# patch to the working tree before building. The marker check keeps the step
-# idempotent: no-op when already applied, re-applies after a
+# patches to the working tree before building. The marker check keeps each
+# step idempotent: no-op when already applied, re-applies after a
 # `git submodule update` reset the tree. (The gmake project lives at
 # <bgfx>/.build/projects/<name>, so the bgfx root is three levels up and the
 # third-party dir one more.)
 BGFX_ROOT="$(cd "$PROJ/../../.." && pwd)"
-BGFX_PATCH="$(cd "$BGFX_ROOT/.." && pwd)/patches/bgfx/0000-dma-buf-texture-export.patch"
-if [ -f "$BGFX_PATCH" ] && ! grep -q "getTextureDmaBuf" "$BGFX_ROOT/include/bgfx/bgfx.h"; then
-    echo "[tp] applying $(basename "$BGFX_PATCH")"
-    patch -p1 -d "$BGFX_ROOT" --silent < "$BGFX_PATCH"
-fi
+BGFX_PATCH_DIR="$(cd "$BGFX_ROOT/.." && pwd)/patches/bgfx"
+# bgfx_apply_patch <patch file> <marker file, relative to bgfx root> <marker>
+# Apply the patch unless its marker string is already present in the marker
+# file (i.e. the patch — or a later state of the tree — already carries it).
+bgfx_apply_patch() {
+    local file="$1" marker_file="$2" marker="$3"
+    if [ -f "$BGFX_PATCH_DIR/$file" ] && ! grep -q "$marker" "$BGFX_ROOT/$marker_file"; then
+        echo "[tp] applying $file"
+        patch -p1 -d "$BGFX_ROOT" --silent < "$BGFX_PATCH_DIR/$file"
+    fi
+}
+# 0000 adds the getTextureDmaBuf() API (declared in bgfx.h).
+bgfx_apply_patch "0000-dma-buf-texture-export.patch" "include/bgfx/bgfx.h" "getTextureDmaBuf"
+# 0001 fixes the Vulkan dma-buf export on drivers that reject the queried
+# format modifier: the modifier query must resolve through GIPA, and a failed
+# tiled vkCreateImage falls back to linear (marked by the retry trace in
+# renderer_vk.cpp).
+bgfx_apply_patch "0001-dmabuf-tiled-fallback.patch" "src/renderer_vk.cpp" "tiled dma-buf image failed"
 
 make -C "$PROJ" "config=$CFG" "$@"

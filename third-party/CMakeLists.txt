@@ -150,10 +150,14 @@ else()
                 "${CMAKE_CURRENT_SOURCE_DIR}/tp_build.sh"
                 "${BGFX_ROOT}/include/bgfx/bgfx.h")
     # Patches live in the superproject (third-party/patches/<component>/),
-    # outside the submodules, so a fresh clone carries them.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/bgfx/0000-dma-buf-texture-export.patch")
-        list(APPEND TP_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/patches/bgfx/0000-dma-buf-texture-export.patch")
-    endif()
+    # outside the submodules, so a fresh clone carries them. Depend on each
+    # patch so editing one re-runs the build (which re-applies the patches).
+    foreach(TP_BGFX_PATCH 0000-dma-buf-texture-export 0001-dmabuf-tiled-fallback)
+        set(TP_BGFX_PATCH_FILE "${CMAKE_CURRENT_SOURCE_DIR}/patches/bgfx/${TP_BGFX_PATCH}.patch")
+        if(EXISTS "${TP_BGFX_PATCH_FILE}")
+            list(APPEND TP_DEPS "${TP_BGFX_PATCH_FILE}")
+        endif()
+    endforeach()
     add_custom_command(
         OUTPUT ${TP_ARTIFACTS}
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tp_build.sh"

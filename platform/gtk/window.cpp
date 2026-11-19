@@ -464,27 +464,6 @@ static gboolean onRender(GtkGLArea* area, GdkGLContext* context, gpointer user) 
         glBindVertexArray(0);
     }
 
-    if (getenv("TETRIS_EGL_DEBUG")) {
-        static bool loggedOnce = false;
-        if (!loggedOnce) {
-            loggedOnce = true;
-            const char* r = (const char*)glGetString(GL_RENDERER);
-            fprintf(stderr, "[dbg] C1 renderer: %s\n", r ? r : "(null)");
-        }
-        // fboTex is the texture id GTK attached to the area FBO — exactly
-        // the image GSK will present this frame.
-        GLint fbo = 0;
-        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
-        GLuint fboTex = 0;
-        if (fbo != 0)
-            glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                                                  GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
-                                                  (GLint*)&fboTex);
-        fprintf(stderr, "[dbg] frame w=%u h=%u img=%d fbo=%d fboTex=%u sceneTex=%u glerr=0x%x\n",
-                w, h, (int)(s_gl.currentImage != EGL_NO_IMAGE), (int)fbo,
-                (unsigned)fboTex, (unsigned)s_gl.sceneTex, (unsigned)glGetError());
-    }
-
     return TRUE;  // we handled the draw
 }
 
@@ -601,10 +580,6 @@ const UiWindow* uiCreateWindow(uint32_t w, uint32_t h, const char* title) {
     s_uiWindow.nwh = nullptr;
     s_uiWindow.ndt = nullptr;
     s_uiWindow.offscreen = 1;  // the renderer renders offscreen (bgfx, Vulkan)
-    if (getenv("TETRIS_EGL_DEBUG"))
-        fprintf(stderr, "[dbg] ready=%d display=%p ctx=%p sceneTex=%u\n",
-                (int)s_gl.ready, (void*)s_gl.display, (void*)s_gl.areaCtx,
-                (unsigned)s_gl.sceneTex);
     return &s_uiWindow;
 }
 
