@@ -16,6 +16,26 @@ constexpr int W = TetrisBackend::kCols;
 constexpr int H = TetrisBackend::kRows;
 constexpr int EMPTY = -1;
 
+// ms per row, speeds up with level (level >= 19: the minimum).
+constexpr int GRAVITY_INTERVAL_MS[20] = {
+    800, 720, 630, 550, 470, 380, 300, 220, 130, 100,
+    80, 70, 60, 50, 40, 30, 20, 15, 10, 10};
+
+constexpr int gravityIntervalFor(int lvl) {
+    return GRAVITY_INTERVAL_MS[std::min(lvl, 19)];
+}
+
+// The key repeater interval (DT) anchors, in ms: 110 at level 0 (the old
+// DT at level 3), 51.2/1.05 ≈ 48.76 at level 10 and above (5% faster than
+// the previous curve's level-10 value). Linear in between (see
+// TetrisBackend::dtIntervalMs).
+//
+// RotateCW repeats at ROTATION_FREQ (75%) of the movement frequency — i.e.,
+// once every DT/ROTATION_FREQ (see TetrisBackend::repeatIntervalMs).
+constexpr double DT_LEVEL_0_MS  = gravityIntervalFor(3) / 5.0;  // 110 ms
+constexpr double DT_LEVEL_10_MS = 51.2 / 1.05;                  // 48.76 ms
+constexpr double ROTATION_FREQ  = 0.75;
+
 enum Piece { I = 0, O = 1, T = 2, S = 3, Z = 4, J = 5, L = 6, NUM_PIECES = 7 };
 
 // CELLS[pi][rot][cell] = {dx, dy} (relative to the piece origin, y grows down)
@@ -91,9 +111,6 @@ public:
         }
     }
 
-    // One fifth of the falling tick: the repeat interval (DT).
-    double dtIntervalMs() const { return gravityInterval() / 5.0; }
-
     // One input action (a press or a repeat step).
     void performAction(TetrisBackend::Key k) {
         switch (k) {
@@ -142,8 +159,8 @@ public:
         r.refs = 1;
         m_held.push_back(k);
         if (!paused) {
-            performAction(k);          // the press moves once, immediately
-            r.accMs = -dtIntervalMs(); // one DT of pause before the first repeat
+            performAction(k);                              // the press moves once, immediately
+            r.accMs = -TetrisBackend::repeatIntervalMs(k, level); // one interval of pause before the first repeat
         }
     }
 
@@ -170,16 +187,16 @@ public:
             gravityStep();
         }
         // The held key pressed most recently moves the piece: one step per
-        // DT (gravityInterval/5) while it is held. Only the active (last
-        // pressed) key's timer runs; the others are frozen until they are
-        // the most recent again.
+        // repeat interval (see TetrisBackend::repeatIntervalMs) while it is
+        // held. Only the active (last pressed) key's timer runs; the others
+        // are frozen until they are the most recent again.
         if (!m_held.empty()) {
             const TetrisBackend::Key active = m_held.back();
             Repeat& r = m_rep[repIndex(active)];
             r.accMs += dtSeconds * 1000.0;
-            const double dt = dtIntervalMs();
-            while (r.accMs >= dt - EPS_MS) {
-                r.accMs -= dt;
+            const double repMs = TetrisBackend::repeatIntervalMs(active, level);
+            while (r.accMs >= repMs - EPS_MS) {
+                r.accMs -= repMs;
                 performAction(active);
             }
         }
@@ -343,9 +360,7 @@ private:
     }
 
     int gravityInterval() const {  // ms per row, speeds up with level
-        static const int table[] = {800,720,630,550,470,380,300,220,130,100,
-                                    80, 70, 60, 50, 40, 30, 20, 15, 10, 10};
-        return table[std::min(level, 19)];
+        return gravityIntervalFor(level);
     }
 
     void gravityStep() {
@@ -361,6 +376,20 @@ TetrisBackend::~TetrisBackend() { delete m_impl; }
 
 void TetrisBackend::keyDown(Key k) { m_impl->keyDown(k); }
 void TetrisBackend::keyUp(Key k) { m_impl->keyUp(k); }
+
+double TetrisBackend::dtIntervalMs(int level) {
+    // Linear between the two anchors (DT_LEVEL_0_MS / DT_LEVEL_10_MS);
+    // clamped above level 10.
+    return DT_LEVEL_0_MS + (DT_LEVEL_10_MS - DT_LEVEL_0_MS)
+           * std::clamp(level, 0, 10) / 10.0;
+}
+
+double TetrisBackend::repeatIntervalMs(Key k, int level) {
+    // Rotation repeats at ROTATION_FREQ (75%) of the movement frequency.
+    const double dt = dtIntervalMs(level);
+    return k == Key::RotateCW ? dt / ROTATION_FREQ : dt;
+}
+
 void TetrisBackend::update(double dtSeconds) { m_impl->update(dtSeconds); }
 TetrisBackend::Snapshot TetrisBackend::state() const { return m_impl->state(); }
 bool TetrisBackend::quitRequested() const { return m_impl->quitRequested(); }

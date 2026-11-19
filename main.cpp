@@ -33,9 +33,10 @@
 //
 //  Holding left / right / down / up: the game moves the piece with its own
 //  repeater — one step immediately on the press, a pause of one DT, then
-//  one step per DT while the key is held (DT = 1/5 of the falling tick, so
-//  the repeat speeds up with the level). The system's key auto-repeat is
-//  ignored (its delay and rate vary from system to system).
+//  one step per DT while the key is held (DT runs from 110 ms at level 0
+//  down to 51.2/1.05 ≈ 48.76 ms at level 10+, linearly in between; up
+//  (rotate CW) repeats at 75% of the movement frequency). The system's key
+//  auto-repeat is ignored (its delay and rate vary from system to system).
 // ============================================================================
 
 #include "tetris_frontend.h"

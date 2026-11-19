@@ -58,16 +58,25 @@ public:
     //
     // Repeatable keys (Left, Right, Down, RotateCW): a press moves the
     // piece once immediately; then, unless the key is released, it repeats
-    // every DT = gravityInterval()/5 (one fifth of the falling tick — it
-    // speeds up with the level) after a pause of one DT. When several
-    // repeatable keys are held at once, the most recently pressed one
-    // moves the piece; releasing it hands the movement back to the
-    // previously pressed one.
+    // every repeatIntervalMs(key, level) after a pause of one interval.
+    // When several repeatable keys are held at once, the most recently
+    // pressed one moves the piece; releasing it hands the movement back to
+    // the previously pressed one.
     //
     // The other keys (RotateCCW, HardDrop, Pause, Restart, Quit) act once,
     // on the press.
     void keyDown(Key k);
     void keyUp(Key k);
+
+    // The movement repeat interval (DT), in ms, for a given level: 110 ms
+    // at level 0, 51.2/1.05 ≈ 48.76 ms at level 10 and above, linearly
+    // interpolated in between.
+    static double dtIntervalMs(int level);
+
+    // The repeat interval (in ms) of a specific repeatable key: movement
+    // (Left, Right, Down) repeats every dtIntervalMs(level); RotateCW at
+    // 75% of the movement frequency, i.e. every DT/0.75 (slower).
+    static double repeatIntervalMs(Key k, int level);
 
     // Advance the game by dt seconds (drives piece gravity).
     void update(double dtSeconds);
