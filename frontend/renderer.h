@@ -1,9 +1,10 @@
 // ============================================================================
 //  Renderer — the common, platform-agnostic part of the bgfx renderer.
 //  ---------------------------------------------------------------------------
-//  Single dynamic vertex buffer, one draw call per frame. All drawing is
-//  derived from the TetrisBackend::Snapshot — this class knows nothing about
-//  game rules.
+//  A few dynamic vertex buffers, one draw call per texture per frame
+//  (field artwork, brick gems, font-atlas text/HUD). All drawing is
+//  derived from the TetrisBackend::Snapshot — this class knows nothing
+//  about game rules.
 //
 //  This header (and frontend/renderer.cpp) owns everything that is identical
 //  on every platform: the scene construction (board, pieces, HUD), the
@@ -52,6 +53,24 @@ namespace tetris::frontend {
 struct RGB { float r, g, b; };
 // One vertex: position (world), UV (atlas), color.
 struct Vert { float x, y, u, v, r, g, b; };
+
+// A rectangle in field.png pixel coordinates (top-left origin, y down).
+struct ImageRect { int x0, y0, x1, y1; };
+// A rectangle in world coordinates (y up).
+struct RectF { float x0, y0, x1, y1; };
+
+// The per-frame layout in world space: the board rect (aligned with the
+// "glass" of field.png, the dark-brick background) and the HUD value slots
+// (the artwork's right-side SCORE / LEVEL / LINES panels and the NEXT
+// preview area). Recomputed every frame from the window size, because the
+// artwork is contain-fit + centered in the window.
+struct Layout {
+    RectF board;
+    RectF score;
+    RectF level;
+    RectF lines;
+    RectF next;
+};
 
 class Renderer {
 public:
@@ -128,12 +147,41 @@ private:
                  const UVRect& uv, float r, float g, float b, float grow = 0.0f);
     void drawText(std::vector<Vert>& v, float x, float y, const std::string& s,
                   const RGB& c, float cell = 1.0f);
-    void drawNext(std::vector<Vert>& v, const TetrisBackend::Cell cells[4], float bx, float by,
-                  float grow = 0.0f);
-    void drawOverlay(std::vector<Vert>& v, const std::string& head, const std::string& sub,
-                     float grow = 0.0f);
-    void buildScene(std::vector<Vert>& v, const TetrisBackend::Snapshot& s, float grow);
+    // Append one tetromino cell as a brick gem: the brick-atlas texture for
+    // color index t (or a solid-color quad from the font atlas when the brick
+    // images are missing), tinted by c, into the brick (or text) vertex
+    // buffer. x0,y0 = cell bottom-left, x1,y1 = top-right (world, y up).
+    void drawBrickCell(float x0, float y0, float x1, float y1, int t,
+                       const RGB& c, float grow = 0.0f);
+    // Append the NEXT preview: the 4x4 box with bottom-left (bx,by) and cell
+    // size `cell`, built from brick gems.
+    void drawNext(const TetrisBackend::Cell cells[4], float bx, float by,
+                  float cell, float grow = 0.0f);
+    // Append a numeric value in gold, centered in its panel slot.
+    void drawValue(std::vector<Vert>& v, const RectF& slot, int value, int maxDigits);
+    void drawOverlay(std::vector<Vert>& v, const Layout& L, const std::string& head,
+                     const std::string& sub, float grow = 0.0f);
+    // Build the scene: brick cells (locked grid, ghost, piece, NEXT) go into
+    // m_brickVerts; HUD text and overlays into m_verts.
+    void buildScene(const Layout& L, const TetrisBackend::Snapshot& s, float grow);
     void computeOrtho(float* proj, uint32_t pw, uint32_t ph) const;
+    // The per-frame layout (board + HUD slots) in world space. The board is
+    // the "glass" of field.png mapped through the artwork's contain-fit
+    // screen rect into world; without the artwork, the old fixed layout.
+    Layout computeLayout(uint32_t pw, uint32_t ph) const;
+    // Load res/field.png (next to the executable) into a GPU texture.
+    // A failure is non-fatal: the game renders without the background.
+    void loadFieldImage();
+    // Load the seven res/brick-<color>.png textures into one 4x2 GPU atlas.
+    // A failure is non-fatal: pieces render as solid-color quads instead.
+    void loadBricks();
+    // The UV cell of piece color t in the brick atlas (4x2 grid, row-major).
+    UVRect brickUV(int t) const;
+    // Append the field background quad (contain-fit to the window, centered)
+    // in world space. The window center maps to world (13,13) with
+    // min(pw,ph)/26 px per world unit (computeOrtho), so the screen-space
+    // image rectangle converts to world by dividing by that scale.
+    void drawField(std::vector<Vert>& v, uint32_t pw, uint32_t ph);
 
     // --- state ---------------------------------------------------------------
     bool ok = false;
@@ -145,7 +193,22 @@ private:
     bgfx::TextureHandle atlas = BGFX_INVALID_HANDLE;
     bgfx::UniformHandle uTex = BGFX_INVALID_HANDLE;
     bgfx::VertexLayout layout;
+    // Frame vertex assembly: text/HUD (font atlas) and brick gems (brick
+    // atlas); the two submits use different textures, hence two buffers.
     std::vector<Vert> m_verts;
+    std::vector<Vert> m_brickVerts;
+    // Field background (res/field.png), drawn under the scene; BGFX_INVALID_
+    // HANDLE when the image could not be loaded.
+    bgfx::TextureHandle fieldTex = BGFX_INVALID_HANDLE;
+    bgfx::DynamicVertexBufferHandle fieldVbuf = BGFX_INVALID_HANDLE;
+    uint32_t fieldW = 0, fieldH = 0;
+    // Brick atlas (the seven res/brick-<color>.png gems in a 4x2 grid);
+    // BGFX_INVALID_HANDLE when the images could not be loaded (the pieces
+    // then render as solid-color quads from the font atlas).
+    bgfx::TextureHandle brickTex = BGFX_INVALID_HANDLE;
+    bgfx::DynamicVertexBufferHandle brickVbuf = BGFX_INVALID_HANDLE;
+    uint32_t brickW = 0, brickH = 0;  // one brick's size in pixels
+    bool m_bricksOk = false;
 };
 
 // Write a 24-bit BMP from 4-byte pixels (RGBA or BGRA, depending on the

@@ -82,11 +82,13 @@ endif()
 
 set(TP_SUFFIX "Release")  # library filename suffix (Release)
 
-set(TP_LIB_BX      "${TP_BIN}/${TP_LIB_PREFIX}bx${TP_SUFFIX}${TP_LIB_SUFFIX}")
-set(TP_LIB_BIMG    "${TP_BIN}/${TP_LIB_PREFIX}bimg${TP_SUFFIX}${TP_LIB_SUFFIX}")
-set(TP_LIB_BGFX    "${TP_BIN}/${TP_LIB_PREFIX}bgfx${TP_SUFFIX}${TP_LIB_SUFFIX}")
-set(TP_EXE_SHADERC "${TP_BIN}/shaderc${TP_SUFFIX}${CMAKE_EXECUTABLE_SUFFIX}")
-set(TP_ARTIFACTS "${TP_LIB_BX}" "${TP_LIB_BIMG}" "${TP_LIB_BGFX}" "${TP_EXE_SHADERC}")
+set(TP_LIB_BX          "${TP_BIN}/${TP_LIB_PREFIX}bx${TP_SUFFIX}${TP_LIB_SUFFIX}")
+set(TP_LIB_BIMG        "${TP_BIN}/${TP_LIB_PREFIX}bimg${TP_SUFFIX}${TP_LIB_SUFFIX}")
+set(TP_LIB_BIMG_DECODE "${TP_BIN}/${TP_LIB_PREFIX}bimg_decode${TP_SUFFIX}${TP_LIB_SUFFIX}")
+set(TP_LIB_BGFX        "${TP_BIN}/${TP_LIB_PREFIX}bgfx${TP_SUFFIX}${TP_LIB_SUFFIX}")
+set(TP_EXE_SHADERC     "${TP_BIN}/shaderc${TP_SUFFIX}${CMAKE_EXECUTABLE_SUFFIX}")
+set(TP_ARTIFACTS "${TP_LIB_BX}" "${TP_LIB_BIMG}" "${TP_LIB_BIMG_DECODE}"
+                  "${TP_LIB_BGFX}" "${TP_EXE_SHADERC}")
 
 if(WIN32)
     set(TP_PROJGEN_OUTPUT "${TP_PROJ}/bgfx.sln")
@@ -130,6 +132,7 @@ if(WIN32)
                 "${TP_VS}"
                 "${TP_PROJ}/bx.vcxproj"
                 "${TP_PROJ}/bimg.vcxproj"
+                "${TP_PROJ}/bimg_decode.vcxproj"
                 "${TP_PROJ}/bgfx.vcxproj"
                 "${TP_PROJ}/shaderc.vcxproj"
         COMMENT "[tp] building bx bimg bgfx shaderc (msbuild)"
@@ -162,20 +165,21 @@ else()
         OUTPUT ${TP_ARTIFACTS}
         COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/tp_build.sh"
                 "${CMAKE_CURRENT_BINARY_DIR}/tp-make.lock"
-                "${TP_PROJ}" "${TP_CFG}" bx bimg bgfx shaderc
+                "${TP_PROJ}" "${TP_CFG}" bx bimg bimg_decode bgfx shaderc
         DEPENDS ${TP_DEPS}
         COMMENT "[tp] building bx bimg bgfx shaderc"
         VERBATIM)
 endif()
 
 # Per-component targets (no-op if their artifact is current).
-add_custom_target(tp_bx      DEPENDS ${TP_LIB_BX})
-add_custom_target(tp_bimg    DEPENDS ${TP_LIB_BIMG})
-add_custom_target(tp_bgfx    DEPENDS ${TP_LIB_BGFX})
-add_custom_target(tp_shaderc DEPENDS ${TP_EXE_SHADERC})
+add_custom_target(tp_bx          DEPENDS ${TP_LIB_BX})
+add_custom_target(tp_bimg        DEPENDS ${TP_LIB_BIMG})
+add_custom_target(tp_bimg_decode DEPENDS ${TP_LIB_BIMG_DECODE})
+add_custom_target(tp_bgfx        DEPENDS ${TP_LIB_BGFX})
+add_custom_target(tp_shaderc     DEPENDS ${TP_EXE_SHADERC})
 
 # Everything the app needs from third-party.
-add_custom_target(third-party DEPENDS tp_bx tp_bimg tp_bgfx tp_shaderc)
+add_custom_target(third-party DEPENDS tp_bx tp_bimg tp_bimg_decode tp_bgfx tp_shaderc)
 
 # Remove all third-party artifacts — same as bgfx's own `make clean`:
 #   cmake --build build --target third-party-clean
@@ -189,3 +193,4 @@ add_custom_target(third-party-clean
 set(TP_BIN    "${TP_BIN}"    PARENT_SCOPE)
 set(BGFX_ROOT "${BGFX_ROOT}" PARENT_SCOPE)
 set(BX_ROOT   "${BX_ROOT}"   PARENT_SCOPE)
+set(BIMG_ROOT "${BIMG_ROOT}" PARENT_SCOPE)

@@ -151,27 +151,31 @@ target_include_directories(tetrisfront PUBLIC
     ${CMAKE_SOURCE_DIR}          # ui/window.h etc.
     ${CMAKE_SOURCE_DIR}/frontend # font.h
     ${BGFX_ROOT}/include
-    ${BX_ROOT}/include)
+    ${BX_ROOT}/include
+    ${BIMG_ROOT}/include)        # bimg/bimg.h + bimg/decode.h
+# The third-party libs are always built Release, so match that for the bx
+# headers (bx/config.h refuses to compile without this).
+target_compile_definitions(tetrisfront PRIVATE BX_CONFIG_DEBUG=0)
 if(APPLE)
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
-        bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
+        bgfxRelease bimgRelease bimg_decodeRelease bxRelease)  # via the link dir below
 elseif(WIN32)
     # No extra libs: the frontend only talks to bgfx (and to the UI layer's
     # C API); the D3D11/DComp import libs belong to the UI module (the exe).
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
-        bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
+        bgfxRelease bimgRelease bimg_decodeRelease bxRelease)  # via the link dir below
 else()
     # The Linux renderer is bgfx (Vulkan backend, headless/offscreen); the
     # frontend no longer touches GL/EGL directly (the UI module owns the
     # GLES2 blit + the dma-buf import).
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
-        bgfxRelease bimgRelease bxRelease)   # resolved via the link dir below
+        bgfxRelease bimgRelease bimg_decodeRelease bxRelease)  # via the link dir below
 endif()
 target_link_directories(tetrisfront PUBLIC ${TP_BIN})
-add_dependencies(tetrisfront tp_bx tp_bimg tp_bgfx)
+add_dependencies(tetrisfront tp_bx tp_bimg tp_bimg_decode tp_bgfx)
 
 # ----------------------------------------------------------------------------
 #  shaders — generate the C header arrays from the .sc sources, into the
@@ -212,6 +216,14 @@ add_executable(tetris
 target_link_libraries(tetris PRIVATE
     tetrisfront
     ${UI_LINK})
+
+# Resources: the res/ folder is copied next to the executable — the game
+# loads res/field.png relative to the binary at startup.
+add_custom_command(TARGET tetris POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_SOURCE_DIR}/res $<TARGET_FILE_DIR:tetris>/res
+    COMMENT "[res] copying res/ next to the executable"
+    VERBATIM)
 
 # ----------------------------------------------------------------------------
 #  test_das — standalone verification of the backend's key repeater (DAS).

@@ -1,0 +1,140 @@
+diff --git a/src/renderer_vk.cpp b/src/renderer_vk.cpp
+index c3ee89b7c..d1f742b17 100644
+--- a/src/renderer_vk.cpp
++++ b/src/renderer_vk.cpp
+@@ -6953,17 +6953,40 @@ VK_DESTROY
+ 	// this elimination in testing, so volatile is used instead.)
+ 	static void initDmaBufExportChain(
+ 		uint64_t _drmFormatModifier,
++		uint64_t _planeSize,
++		uint64_t _rowPitch,
+ 		volatile VkExternalMemoryImageCreateInfo* _externalInfo,
+-		volatile VkImageDrmFormatModifierExplicitCreateInfoEXT* _drmModifierInfo)
+-	{
++		volatile VkImageDrmFormatModifierExplicitCreateInfoEXT* _drmModifierInfo,
++		volatile VkSubresourceLayout* _planeLayout)
++	{
++		// A tiled (DRM format modifier) image requires planeCount==1 and a
++		// valid 40-byte VkSubresourceLayout. The NVIDIA driver unconditionally
++		// dereferences pPlaneLayouts[0] (reading 40 bytes) when planeCount==1
++		// and its internal modifier lookup returns a zero-flag entry; a NULL
++		// pointer faults (SEGV). The driver recomputes the real stride fields
++		// itself, so the values only need to be sensible and readable. When no
++		// modifier is selected (linear) the modifier node is not chained and
++		// the count stays 0, so pPlaneLayouts is never dereferenced.
++		const bool tiled = 0 != _drmFormatModifier;
++
++		_planeLayout->offset     = 0;
++		_planeLayout->size       = _planeSize;
++		_planeLayout->rowPitch   = _rowPitch;
++		_planeLayout->arrayPitch = 0;
++		_planeLayout->depthPitch = 0;
++
+ 		_drmModifierInfo->sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
+ 		_drmModifierInfo->pNext = NULL;
+ 		_drmModifierInfo->drmFormatModifier = _drmFormatModifier;
+-		_drmModifierInfo->drmFormatModifierPlaneCount = 0;
+-		_drmModifierInfo->pPlaneLayouts = NULL;
++		_drmModifierInfo->drmFormatModifierPlaneCount = tiled ? 1 : 0;
++		_drmModifierInfo->pPlaneLayouts = tiled
++			? reinterpret_cast<const VkSubresourceLayout*>(
++				const_cast<VkSubresourceLayout*>(_planeLayout))
++			: NULL
++			;
+ 
+ 		_externalInfo->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+-		_externalInfo->pNext = (0 != _drmFormatModifier)
++		_externalInfo->pNext = tiled
+ 			? reinterpret_cast<const void*>(
+ 				const_cast<VkImageDrmFormatModifierExplicitCreateInfoEXT*>(_drmModifierInfo))
+ 			: NULL
+@@ -7064,17 +7087,29 @@ VK_DESTROY
+ 				&& 1 == m_numLayers
+ 				;
+ 
++			// [fork] Declared in this scope (not inside the exportable block)
++			// so the chain structs outlive the vkCreateImage calls below: the
++			// driver walks the pNext chain while creating the image.
++			VkImageDrmFormatModifierExplicitCreateInfoEXT drmModifierInfo;
++			VkExternalMemoryImageCreateInfo externalInfo;
++			VkSubresourceLayout planeLayout;
++
+ 			if (exportable)
+ 			{
+ 				m_drmFormatModifier = s_renderVK->queryDmaBufModifier(m_format);
+ 
+-				VkImageDrmFormatModifierExplicitCreateInfoEXT drmModifierInfo;
+-				VkExternalMemoryImageCreateInfo externalInfo;
+ 				// [fork] Initialize the chain through volatile pointers (see
+ 				// initDmaBufExportChain): the plain stores here are otherwise
+ 				// dead-store-eliminated because the chain escapes to the driver
+ 				// only through a second-order pointer.
+-				initDmaBufExportChain(m_drmFormatModifier, &externalInfo, &drmModifierInfo);
++				initDmaBufExportChain(
++					m_drmFormatModifier
++					, uint64_t(m_width)*m_height*4
++					, uint64_t(m_width)*4
++					, &externalInfo
++					, &drmModifierInfo
++					, &planeLayout
++					);
+ 
+ 				if (0 != m_drmFormatModifier)
+ 				{
+@@ -7094,6 +7129,33 @@ VK_DESTROY
+ 			}
+ 
+ 			result = vkCreateImage(device, &ici, allocatorCb, &m_textureImage);
++
++			// [fork] Some drivers reject a tiled (DRM format modifier) image
++			// create even when the format modifier query reports support
++			// (e.g. Mesa ANV refuses the modifier the query picked). Fall
++			// back to a linear image: the dma-buf can still be exported, and
++			// GL import of linear buffers works on those drivers.
++			if (VK_SUCCESS != result && exportable && 0 != m_drmFormatModifier)
++			{
++				BX_TRACE("Create texture image: tiled dma-buf image failed (modifier 0x%" PRIx64
++					", result %d), retrying linear."
++					, m_drmFormatModifier
++					, (int)result
++					);
++				m_drmFormatModifier = 0;
++				initDmaBufExportChain(
++					0
++					, uint64_t(m_width)*m_height*4
++					, uint64_t(m_width)*4
++					, &externalInfo
++					, &drmModifierInfo
++					, &planeLayout
++					);
++				ici.pNext = &externalInfo;
++				ici.tiling = VK_IMAGE_TILING_LINEAR;
++				result = vkCreateImage(device, &ici, allocatorCb, &m_textureImage);
++			}
++
+ 			if (VK_SUCCESS != result)
+ 			{
+ 				BX_TRACE("Create texture image error: vkCreateImage failed %d: %s.", result, getName(result) );
+diff --git a/src/renderer_vk.h b/src/renderer_vk.h
+index 741820583..73e550563 100644
+--- a/src/renderer_vk.h
++++ b/src/renderer_vk.h
+@@ -96,6 +96,7 @@
+ 			VK_IMPORT_INSTANCE_FUNC(false, vkGetPhysicalDeviceFormatProperties);       \
+ 			VK_IMPORT_INSTANCE_FUNC(false, vkGetPhysicalDeviceFeatures);               \
+ 			VK_IMPORT_INSTANCE_FUNC(false, vkGetPhysicalDeviceImageFormatProperties);  \
++			VK_IMPORT_INSTANCE_FUNC(true,  vkGetPhysicalDeviceFormatProperties2);       \
+ 			VK_IMPORT_INSTANCE_FUNC(false, vkGetPhysicalDeviceMemoryProperties);       \
+ 			VK_IMPORT_INSTANCE_FUNC(false, vkGetPhysicalDeviceQueueFamilyProperties);  \
+ 			VK_IMPORT_INSTANCE_FUNC(true,  vkGetPhysicalDeviceQueueFamilyProperties2KHR); \
+@@ -247,8 +248,8 @@
+ 			VK_IMPORT_DEVICE_FUNC(true, vkCmdDecodeVideoKHR);                         \
+ 			/* VK_KHR_external_memory_fd / VK_EXT_external_memory_dma_buf */          \
+ 			VK_IMPORT_DEVICE_FUNC(true,  vkGetMemoryFdKHR);                           \
+-			/* VK_KHR_maintenance1 */                                                 \
+-			VK_IMPORT_DEVICE_FUNC(true,  vkGetPhysicalDeviceFormatProperties2);       \
++			/* VK_KHR_maintenance1 (the KHR alias; the core entry point is an     \
++			   instance-level function, imported via vkGetInstanceProcAddr above) */ \
+ 			VK_IMPORT_DEVICE_FUNC(true,  vkGetPhysicalDeviceFormatProperties2KHR);    \
+ 
+ #define VK_DESTROY                                \
