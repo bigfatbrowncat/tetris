@@ -14,6 +14,9 @@
 #    .build/osx-arm64/bin/:        libbxRelease.a  ...  shadercRelease
 #    .build/linux64_gcc/bin/:      libbxRelease.a  ...  shadercRelease
 #    .build/win64_vs2022/bin/:     bxRelease.lib   ...  shadercRelease.exe
+#  built in the app's configuration: a Debug app asks for the Debug variants
+#  (libbxDebug.a / bxDebug.lib / shadercDebug.exe), a Release app — for the
+#  Release ones above.
 #
 #  Windows toolchain: the pinned bx requires MSVC >= 19.35 (VS 2022 17.5+),
 #  so the Visual Studio action is chosen from the compiler version
@@ -22,7 +25,8 @@
 #
 #  Targets:
 #    tp_projgen         (re)generate the project if missing
-#    tp_bx/tp_bimg/tp_bgfx/tp_shaderc   component artifacts (one build run)
+#    tp_bx/tp_bimg/tp_bgfx/tp_shaderc   component artifacts (one build run
+#                                        per configuration)
 #    third-party        everything the app needs
 #    third-party-clean  remove all third-party artifacts (bgfx/.build)
 # ============================================================================
@@ -30,6 +34,16 @@
 set(BGFX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/bgfx" CACHE INTERNAL "bgfx checkout")
 set(BX_ROOT   "${CMAKE_CURRENT_SOURCE_DIR}/bx"   CACHE INTERNAL "bx checkout")
 set(BIMG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/bimg" CACHE INTERNAL "bimg checkout")
+
+# The third-party is built in the SAME configuration as the app that links it
+# (Debug app -> bxDebug/bimgDebug/bgfxDebug, Release -> *Release), so the CRT
+# flavour (/MTd vs /MT), _ITERATOR_DEBUG_LEVEL and BX_CONFIG_DEBUG agree at
+# link time — MSVC rejects a mismatch with LNK2038. GENie's project offers
+# exactly two configurations ("Debug", "Release"), so every other app
+# configuration (RelWithDebInfo, MinSizeRel, ...) maps to Release.
+# This is a generator expression: the artifacts of each config are separate
+# files, produced by the custom command of that config.
+set(TP_CONFIG "$<IF:$<CONFIG:Debug>,Debug,Release>")
 
 if(APPLE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
@@ -39,7 +53,9 @@ if(APPLE)
     endif()
     set(TP_GENIE "${BX_ROOT}/tools/bin/darwin/genie")
     set(TP_BIN   "${BGFX_ROOT}/.build/${TP_ARCH}/bin")
-    set(TP_CFG   "release")   # osx config lands in .build/osx-<arch>/bin
+    # gmake config name (bgfx/makefile); the osx config lands in
+    # .build/osx-<arch>/bin
+    set(TP_CFG   "$<IF:$<CONFIG:Debug>,debug,release>")
     set(TP_PROJ  "${BGFX_ROOT}/.build/projects/gmake-${TP_ARCH}")
     set(TP_LIB_PREFIX "lib")
     set(TP_LIB_SUFFIX ".a")
@@ -55,7 +71,7 @@ elseif(WIN32)
     set(TP_GENIE "${BX_ROOT}/tools/bin/windows/genie.exe")
     set(TP_BIN   "${BGFX_ROOT}/.build/win64_${TP_VS}/bin")
     set(TP_PROJ  "${BGFX_ROOT}/.build/projects/${TP_VS}")
-    set(TP_LIB_PREFIX "")      # Windows libraries: <name>Release.lib
+    set(TP_LIB_PREFIX "")      # Windows libraries: <name>Debug.lib / <name>Release.lib
     set(TP_LIB_SUFFIX ".lib")
     # MSBuild: derive it from the compiler's directory
     # (<vs-root>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64 — the cl.exe dir is
@@ -74,13 +90,15 @@ else()
     set(TP_ARCH  "linux-gcc")
     set(TP_GENIE "${BX_ROOT}/tools/bin/linux/genie")
     set(TP_BIN   "${BGFX_ROOT}/.build/linux64_gcc/bin")
-    set(TP_CFG   "release64") # plain `release` is a legacy fallback (-> scripts/)
+    # gmake config name (bgfx/makefile); plain `release`/`debug` is a legacy
+    # fallback (-> scripts/)
+    set(TP_CFG   "$<IF:$<CONFIG:Debug>,debug64,release64>")
     set(TP_PROJ  "${BGFX_ROOT}/.build/projects/gmake-${TP_ARCH}")
     set(TP_LIB_PREFIX "lib")
     set(TP_LIB_SUFFIX ".a")
 endif()
 
-set(TP_SUFFIX "Release")  # library filename suffix (Release)
+set(TP_SUFFIX "${TP_CONFIG}")  # library filename suffix (Debug/Release)
 
 set(TP_LIB_BX          "${TP_BIN}/${TP_LIB_PREFIX}bx${TP_SUFFIX}${TP_LIB_SUFFIX}")
 set(TP_LIB_BIMG        "${TP_BIN}/${TP_LIB_PREFIX}bimg${TP_SUFFIX}${TP_LIB_SUFFIX}")
@@ -130,6 +148,7 @@ if(WIN32)
                 "${BGFX_ROOT}"
                 "${TP_PROJ}/bgfx.sln"
                 "${TP_VS}"
+                "${TP_CONFIG}"
                 "${TP_PROJ}/bx.vcxproj"
                 "${TP_PROJ}/bimg.vcxproj"
                 "${TP_PROJ}/bimg_decode.vcxproj"
@@ -191,6 +210,7 @@ add_custom_target(third-party-clean
 
 # Export to the parent scope.
 set(TP_BIN    "${TP_BIN}"    PARENT_SCOPE)
+set(TP_CONFIG "${TP_CONFIG}" PARENT_SCOPE)
 set(BGFX_ROOT "${BGFX_ROOT}" PARENT_SCOPE)
 set(BX_ROOT   "${BX_ROOT}"   PARENT_SCOPE)
 set(BIMG_ROOT "${BIMG_ROOT}" PARENT_SCOPE)

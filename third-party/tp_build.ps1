@@ -16,7 +16,11 @@
 #
 # Usage:
 #   tp_build.ps1 <lock-dir> <msbuild> <genie> <bgfx-root> <sln> <genie-action>
-#                <project.vcxproj> [project.vcxproj ...]
+#                <config> <project.vcxproj> [project.vcxproj ...]
+#
+# <config> is the configuration the APP is built in (Debug/Release): the
+# third-party must match it or the link fails with LNK2038 (CRT / iterator
+# debug level mismatch).
 param(
     [Parameter(Mandatory=$true)][string]$LockDir,
     [Parameter(Mandatory=$true)][string]$MsBuild,
@@ -24,6 +28,7 @@ param(
     [Parameter(Mandatory=$true)][string]$BgfxRoot,
     [Parameter(Mandatory=$true)][string]$Sln,
     [Parameter(Mandatory=$true)][string]$GenieAction,
+    [Parameter(Mandatory=$true)][string]$Config,
     [Parameter(Mandatory=$true, ValueFromRemainingArguments=$true)][string[]]$Projects
 )
 
@@ -63,7 +68,7 @@ try {
 
     $exitCode = 0
     foreach ($proj in $Projects) {
-        & $MsBuild $proj /p:Configuration=Release /p:Platform=x64 /m /nologo /v:minimal
+        & $MsBuild $proj /p:Configuration=$Config /p:Platform=x64 /m /nologo /v:minimal
         if ($LASTEXITCODE -ne 0) { $exitCode = $LASTEXITCODE; break }
     }
     exit $exitCode

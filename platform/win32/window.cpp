@@ -115,10 +115,15 @@ struct BlitVertex {
     float x, y, z, tx, ty;
 };
 
-// POC: FullScreenImageGraphicContents::getVertices — a full-frame
-// TRIANGLESTRIP in NDC, uv (0,0) top-left. The POC's k is 1 (the 760/width
-// scaling is commented out in the POC), so the quad is size-independent and
-// the vertex buffer is created once, at init.
+// POC: FullScreenImageGraphicContents::getVertices — a full-frame quad in
+// NDC, uv (0,0) top-left. The POC's k is 1 (the 760/width scaling is
+// commented out in the POC), so the quad is size-independent and the vertex
+// buffer is created once, at init.
+//
+// The quad is written out as the two triangles of a TRIANGLE LIST (the
+// topology blitToSwapChain binds) — deliberately not a strip: a strip over
+// this data would generate a degenerate triangle and alternating winding, so
+// one half of the frame would be dropped by any culling rasterizer state.
 const BlitVertex kBlitVerts[6] = {
     {-1.0f,  1.0f, 0.0f, 0.0f, 0.0f},
     { 1.0f,  1.0f, 0.0f, 1.0f, 0.0f},
@@ -185,6 +190,11 @@ struct Win {
     ID3D11VertexShader* blitVs = nullptr;
     ID3D11PixelShader* blitPs = nullptr;
     ID3D11SamplerState* blitSampler = nullptr;
+    // The blit's own blend/rasterizer state — it draws on the immediate
+    // context right after bgfx and must not inherit bgfx's (see
+    // createBlitPipeline).
+    ID3D11BlendState* blitBlend = nullptr;
+    ID3D11RasterizerState* blitRs = nullptr;
 
     // DirectComposition binding: window -> target -> visual -> swap chain.
     IDCompositionDevice* dcomp = nullptr;
@@ -441,6 +451,42 @@ bool createBlitPipeline() {
             break;
         }
 
+        // The blit runs on the immediate context immediately after bgfx's
+        // draws of the same frame, so it inherits whatever pipeline state
+        // bgfx left bound — including a rasterizer state with face culling
+        // (bgfx's front face is counter-clockwise, the opposite of D3D11's
+        // default). Bind the blit's own state so the quad's coverage never
+        // depends on bgfx's: no culling, no scissor, and an opaque copy
+        // (the blit replaces the back buffer; it must not blend with the
+        // #003366 clear underneath, whatever alpha the scene carries).
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        rd.FrontCounterClockwise = FALSE;
+        rd.DepthClipEnable = TRUE;
+        rd.ScissorEnable = FALSE;
+        rd.AntialiasedLineEnable = FALSE;
+        hr = g.device->CreateRasterizerState(&rd, &g.blitRs);
+        if (FAILED(hr) || g.blitRs == nullptr) {
+            fprintf(stderr, "[tetris] CreateRasterizerState failed: 0x%08X\n", (unsigned)hr);
+            break;
+        }
+
+        D3D11_BLEND_DESC bl = {};
+        bl.RenderTarget[0].BlendEnable = FALSE;
+        bl.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        bl.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
+        bl.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        bl.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        bl.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bl.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        hr = g.device->CreateBlendState(&bl, &g.blitBlend);
+        if (FAILED(hr) || g.blitBlend == nullptr) {
+            fprintf(stderr, "[tetris] CreateBlendState failed: 0x%08X\n", (unsigned)hr);
+            break;
+        }
+
         ok = true;
     } while (false);
 
@@ -454,6 +500,8 @@ bool createBlitPipeline() {
         if (g.blitVs != nullptr) { g.blitVs->Release(); g.blitVs = nullptr; }
         if (g.blitPs != nullptr) { g.blitPs->Release(); g.blitPs = nullptr; }
         if (g.blitSampler != nullptr) { g.blitSampler->Release(); g.blitSampler = nullptr; }
+        if (g.blitBlend != nullptr) { g.blitBlend->Release(); g.blitBlend = nullptr; }
+        if (g.blitRs != nullptr) { g.blitRs->Release(); g.blitRs = nullptr; }
     }
     return ok;
 }
@@ -607,13 +655,18 @@ bool blitToSwapChain(PresentMode mode) {
     }
 
     // POC: the full-screen image state (viewport, vertex buffer, shaders,
-    // texture, input layout, topology).
+    // texture, input layout, topology) — plus this layer's own blend and
+    // rasterizer state: this draw shares bgfx's immediate context, so
+    // anything not bound here is whatever bgfx left behind.
     D3D11_VIEWPORT vp = {};
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     vp.Width = (float)g.scW;
     vp.Height = (float)g.scH;
     g.dctx->RSSetViewports(1u, &vp);
+    const FLOAT blendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    g.dctx->OMSetBlendState(g.blitBlend, blendFactor, 0xffffffff);
+    g.dctx->RSSetState(g.blitRs);
     const UINT stride = sizeof(BlitVertex);
     const UINT offset = 0;
     g.dctx->IASetVertexBuffers(0, 1, &g.blitVb, &stride, &offset);
@@ -622,7 +675,12 @@ bool blitToSwapChain(PresentMode mode) {
     g.dctx->PSSetShaderResources(0, 1, &g.sceneSrv);
     g.dctx->PSSetSamplers(0, 1, &g.blitSampler);
     g.dctx->IASetInputLayout(g.blitLayout);
-    g.dctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    // kBlitVerts holds two independently-written triangles, so the topology
+    // must be a list. (It used to be a strip: that reads the same six
+    // vertices as four triangles — one degenerate and two of each winding —
+    // so with bgfx's culling rasterizer state still bound, only one of them
+    // survived and half the window stayed on the clear colour.)
+    g.dctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     // POC: "After this point and before swapChain->Present(), we should
     // render as fast as possible."
@@ -692,6 +750,8 @@ void releaseD3D() {
     if (g.blitVs != nullptr) { g.blitVs->Release(); g.blitVs = nullptr; }
     if (g.blitPs != nullptr) { g.blitPs->Release(); g.blitPs = nullptr; }
     if (g.blitSampler != nullptr) { g.blitSampler->Release(); g.blitSampler = nullptr; }
+    if (g.blitBlend != nullptr) { g.blitBlend->Release(); g.blitBlend = nullptr; }
+    if (g.blitRs != nullptr) { g.blitRs->Release(); g.blitRs = nullptr; }
     if (g.swapChain != nullptr) { g.swapChain->Release(); g.swapChain = nullptr; }
     if (g.dctx != nullptr) { g.dctx->Release(); g.dctx = nullptr; }
     if (g.device != nullptr) { g.device->Release(); g.device = nullptr; }

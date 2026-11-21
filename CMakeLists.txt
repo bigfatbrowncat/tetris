@@ -153,26 +153,36 @@ target_include_directories(tetrisfront PUBLIC
     ${BGFX_ROOT}/include
     ${BX_ROOT}/include
     ${BIMG_ROOT}/include)        # bimg/bimg.h + bimg/decode.h
-# The third-party libs are always built Release, so match that for the bx
-# headers (bx/config.h refuses to compile without this).
-target_compile_definitions(tetrisfront PRIVATE BX_CONFIG_DEBUG=0)
+# bx/config.h refuses to compile without BX_CONFIG_DEBUG, and its value must
+# be the one the third-party libs were built with (Debug -> 1, else 0).
+target_compile_definitions(tetrisfront
+    PRIVATE BX_CONFIG_DEBUG=$<IF:$<CONFIG:Debug>,1,0>)
+# The third-party is built in the same configuration as the app (see
+# third-party/CMakeLists.txt), so link the flavour that matches our CRT:
+# <name>Debug in Debug, <name>Release otherwise. The names are resolved in
+# ${TP_BIN} by the link dir below and built by the add_dependencies() there.
+set(TP_LIBS
+    bgfx${TP_CONFIG}
+    bimg${TP_CONFIG}
+    bimg_decode${TP_CONFIG}
+    bx${TP_CONFIG})
 if(APPLE)
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
-        bgfxRelease bimgRelease bimg_decodeRelease bxRelease)  # via the link dir below
+        ${TP_LIBS})  # via the link dir below
 elseif(WIN32)
     # No extra libs: the frontend only talks to bgfx (and to the UI layer's
     # C API); the D3D11/DComp import libs belong to the UI module (the exe).
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
-        bgfxRelease bimgRelease bimg_decodeRelease bxRelease)  # via the link dir below
+        ${TP_LIBS})  # via the link dir below
 else()
     # The Linux renderer is bgfx (Vulkan backend, headless/offscreen); the
     # frontend no longer touches GL/EGL directly (the UI module owns the
     # GLES2 blit + the dma-buf import).
     target_link_libraries(tetrisfront PUBLIC
         tetrisback
-        bgfxRelease bimgRelease bimg_decodeRelease bxRelease)  # via the link dir below
+        ${TP_LIBS})  # via the link dir below
 endif()
 target_link_directories(tetrisfront PUBLIC ${TP_BIN})
 add_dependencies(tetrisfront tp_bx tp_bimg tp_bimg_decode tp_bgfx)
@@ -193,7 +203,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_custom_command(
     OUTPUT ${GEN_SHADER_HDRS}
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/build_shaders.py
-            ${GEN_SHADERS}/shaders ${TP_BIN}/shadercRelease${CMAKE_EXECUTABLE_SUFFIX} ${BGFX_ROOT}
+            ${GEN_SHADERS}/shaders ${TP_BIN}/shaderc${TP_CONFIG}${CMAKE_EXECUTABLE_SUFFIX} ${BGFX_ROOT}
     DEPENDS ${CMAKE_SOURCE_DIR}/shaders/vs_quad.sc
             ${CMAKE_SOURCE_DIR}/shaders/fs_quad.sc
             ${CMAKE_SOURCE_DIR}/scripts/build_shaders.py
